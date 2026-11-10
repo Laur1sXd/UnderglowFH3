@@ -41,8 +41,8 @@ Each command writes `src/build/Underglow.dll`. Both editions share the code in [
 
 ## Credits
 
-- **FH2Underglow** by Bartholomew Ho provided the effects and palette adapted for this project. [FH2Underglow](https://github.com/qiangqiang101/FH2Underglow)
-- **FH3 Mod Platform** by Levilente provides the loader and SDK. The bundled SDK retains Trinculo54's upstream MIT notice. [Third-party notices](Licenses)
+- **FH2Underglow** by Bartholomew Ho provided the effects and palette adapted for this project.
+- **FH3 Mod Platform** by Levilente provides the loader and SDK. The bundled SDK retains Trinculo54's upstream MIT notice.
 - **FH3 ExtraOptions** by Bartholomew Ho provides the shared ANNA menus used by the ExtraOptions edition.
 
 For a bug report, include your edition, FH3 Mod Platform version, and steps to reproduce it. [Open an issue](https://github.com/Laur1sXd/UnderglowFH3/issues/new)
