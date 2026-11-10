@@ -6,7 +6,7 @@ Add neon underglow to your cars in Forza Horizon 3 on Azimuth. The mod uses the 
 
 ## Install
 
-1. Use the FH3 Xbox One build **1.0.125.0** offline in Azimuth. Install FH3 Mod Platform first. [FH3 Mod Platform](https://github.com/Levilente/FH3_ModPlatform)
+1. Use the FH3 Xbox One build **1.0.125.0** offline in Azimuth. Install FH3 Mod Platform first.
 2. Close Azimuth and extract one install ZIP into the folder containing `azimuth.exe`. The mod goes in `fh3-mods/Underglow.dll`.
 3. If upgrading, keep your existing `fh3-mods/Underglow.ini`. Move any older Underglow DLL with a different filename out of `fh3-mods`.
 4. Start Azimuth and open **Garage → Designs and Paints → Underglow**.
