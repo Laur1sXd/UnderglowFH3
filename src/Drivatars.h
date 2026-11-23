@@ -123,8 +123,11 @@ bool updateDrivatarLights(Byte* manager) {
             drivatarIdentities[slot] = frame.identity;
         }
         if (owner.lights.front() == invalid) continue;
-        const auto audio = npcRadio::frame(frame.identity, now);
-        renderLights(manager, presets, frame.pose, settings, now, owner, &audio);
+        // Photo mode and the pause menu freeze the music's lights too: hold what each Drivatar last heard.
+        static std::array<fx::AudioFrame, maxDrivatars> heldAudio{};
+        auto audio = npcRadio::frame(frame.identity, now);
+        if (gameFrozen.load()) audio = heldAudio[slot]; else heldAudio[slot] = audio;
+        renderLights(manager, presets, frame.pose, settings, gameTick, owner, &audio);
         lit = true;
     }
     return lit;

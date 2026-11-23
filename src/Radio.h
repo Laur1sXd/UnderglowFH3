@@ -8,15 +8,6 @@ constexpr char grooveBus[] = "bus:/MasterVolume/MUSIC/MX_Radio2D/MX_Tracks/Track
 constexpr int fftType = 29, windowParameter = 0, spectrumParameter = 2;
 enum class Route { off, tracks, groove };
 
-#if UG_SUPPORT_HORIZON_RADIO_NETWORK
-struct HorizonRadioBandsV1 {
-    // 1 owns the radio route, including silence. 0 leaves FH3's native route active.
-    int (*read)(float* levels);
-};
-constexpr char horizonRadioBandsName[] = "Horizon3Extended.RadioBands";
-const HorizonRadioBandsV1* horizonRadio{};
-bool networkActive{};
-#endif
 
 using Tick = void (*)(void*, float);
 using Pointer = int (*)(void*, void**);
@@ -100,6 +91,33 @@ fx::AudioFrame frame(ULONGLONG now) {
     return result.last && (paused || now - result.last <= 500) ? result : fx::AudioFrame{};
 }
 
+// While the real radio is silent (the Garage mutes it), previews use this made-up 120 BPM beat so the audio
+// effects can be seen. A real signal always wins. It is only touched on the light render thread.
+std::atomic<ULONGLONG> demoUntil{};
+
+fx::AudioFrame demoFrame(ULONGLONG now) {
+    static fx::AudioFrame frame;
+    const float t = static_cast<float>(now % 600000) * 0.001f;
+    const auto decay = [](float beats, float rate) { return std::exp(-(beats - std::floor(beats)) * rate); };
+    std::array<float, zoneCount> value{};
+    value[fx::kZoneRear] = decay(t * 2.0f, 6.0f);                                            // kick on every beat
+    value[fx::kZoneLeft] = std::clamp(0.45f * decay(t * 2.0f, 3.0f) + 0.45f * (0.5f + 0.5f * std::sin(t * 5.0f)), 0.0f, 1.0f);
+    value[fx::kZoneRight] = 0.1f + 0.9f * decay(t * 2.0f + 0.5f, 8.0f);                     // snare on the off-beats
+    value[fx::kZoneFront] = 0.15f + 0.75f * decay(t * 4.0f, 12.0f) * (0.6f + 0.4f * std::sin(t * 7.0f));
+    const float dt = frame.last ? static_cast<float>(now - frame.last) * 0.001f : 0;
+    frame.last = now;
+    for (size_t i = 0; i < zoneCount; ++i) {
+        frame.lvl[i] = std::clamp(value[i], 0.0f, 1.0f);
+        if (frame.lvl[i] >= frame.peak[i]) {
+            frame.peak[i] = frame.lvl[i];
+            frame.peak_at[i] = now;
+        } else if (now - frame.peak_at[i] > 400) {
+            frame.peak[i] = std::max(frame.lvl[i], frame.peak[i] - 0.8f * dt);
+        }
+    }
+    return frame;
+}
+
 Route currentRoute(const Byte* manager) {
     std::array<Byte, 5> flags;
     if (!manager || !read(manager + 0x74, flags) || !flags[0] || flags[1] || flags[4] ||
@@ -107,7 +125,6 @@ Route currentRoute(const Byte* manager) {
     const auto* swapper = read<Byte*>(manager + 0x40);
     const auto* station = swapper ? read<Byte*>(swapper + 0x50) : nullptr;
     if (!station) return Route::off;
-    if (!supportExtraOptions) return Route::tracks;
     // The native station name is an inline MSVC string. GrooveMusicRadio leaves
     // this internal name intact when it supplies a local file or a live stream.
     constexpr char grooveName[] = "Xbox Music";
@@ -148,7 +165,7 @@ bool connect(ULONGLONG now, Route route) {
     tap.connected = false;
     void* bus = nullptr;
     void* group = nullptr;
-    const bool groove = supportExtraOptions && route == Route::groove;
+    const bool groove = route == Route::groove;
     const auto* path = groove ? grooveBus : tracksBus;
     if (native<int (*)(void*, const char*, void**)>(0x28a9840)(studio, path, &bus) || !bus ||
         native<Pointer>(0x28a9920)(bus, &group) || !group) return false;
@@ -239,7 +256,7 @@ bool measure(ULONGLONG now, Tap& source = tap) {
         }
     }
     if (&source == &tap && *std::max_element(raw.begin(), raw.end()) > 1e-7f) {
-        const bool groove = supportExtraOptions && source.route == Route::groove;
+        const bool groove = source.route == Route::groove;
         bool& heard = groove ? heardGroove : heardTracks;
         if (!heard) log(groove ? "Radio visualizer received Groove Music audio." :
             "Radio visualizer received car radio audio.");
@@ -253,31 +270,6 @@ bool audibleGroove() {
     return !native<int (*)(void*, float*)>(0x27c1b50)(tap.group, &gain) && gain > 0.00001f;
 }
 
-#if UG_SUPPORT_HORIZON_RADIO_NETWORK
-bool useNetwork(ULONGLONG now) {
-    std::array<float, zoneCount> raw{};
-    const bool active = horizonRadio && horizonRadio->read && horizonRadio->read(raw.data()) == 1;
-    if (active != networkActive) {
-        networkActive = active;
-        tap.peaks = {};
-        tap.levels = {};
-        tap.heard = tap.last = 0;
-        publish(now, false);
-        if (active) log("Radio visualizer is listening to Horizon Radio Network.");
-    }
-    if (active) {
-        for (auto& level : raw) level = std::isfinite(level) ? std::clamp(level, 0.0f, 1.0f) : 0.0f;
-        // The provider keeps ownership while waiting for music. Publish silence
-        // without listening to the stock bus under the replacement stream.
-        if (std::none_of(raw.begin(), raw.end(), [](float level) { return level > 1e-7f; })) {
-            tap.levels = {};
-            tap.heard = 0;
-        }
-        publish(now, measureLevels(now, raw));
-    }
-    return active;
-}
-#endif
 
 bool pauseMenuActive() {
     __try {
@@ -316,16 +308,13 @@ void tick(void* manager, float dt) {
             holdForPause(now);
             return;
         }
-#if UG_SUPPORT_HORIZON_RADIO_NETWORK
-        if (useNetwork(now)) return;
-#endif
         if (tap.faulted) return;
         const auto route = currentRoute(static_cast<const Byte*>(manager));
         if (route == Route::tracks || (inMeet && route == Route::off)) {
             // The meet's 2D radio can remain audible when the free-roam
             // driver's station flags are inactive. Measure the actual bus.
             publish(now, connect(now, route) && measure(now));
-        } else if (supportExtraOptions && connect(now, Route::groove) && audibleGroove() && measure(now)) {
+        } else if (connect(now, Route::groove) && audibleGroove() && measure(now)) {
             // Groove has its own streaming player. The stock station can be
             // inactive while Groove is audible, so check its post-fader bus.
             publish(now, true);
@@ -342,12 +331,6 @@ void tick(void* manager, float dt) {
 }
 
 bool install() {
-#if UG_SUPPORT_HORIZON_RADIO_NETWORK
-    if (api->get_interface) {
-        horizonRadio = static_cast<const HorizonRadioBandsV1*>(api->get_interface(horizonRadioBandsName, 1));
-        if (horizonRadio) log("Horizon Radio Network visualizer bridge is ready.");
-    }
-#endif
     constexpr char entry[] = "\x48\x8b\xc4\x55\x53\x56\x57\x41\x54";
     if (!api->hook_function || std::memcmp(game + tickRva, entry, sizeof(entry) - 1)) return false;
     // This native accessor reads the StateFlow InPauseMenu flag.
