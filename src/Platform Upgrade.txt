@@ -1,0 +1,19 @@
+FH3 Mod Platform 1.3.0 compatibility — 12 November 2026
+
+Use the Xbox One FH3 build 1.0.125.0 with Azimuth and FH3 Mod Platform 1.3.0.
+The official platform release is at:
+https://github.com/Levilente/FH3_ModPlatform/releases/tag/v1.3.0
+
+The new FH3 loader is DINPUT8.dll beside azimuth.exe. If migrating from FH3
+Mod Platform 1.2.x, move the old FH3 DWrite.dll and d3dcompiler_47.dll out of
+the Azimuth folder first. Keep an FH2 platform DWrite.dll if you share the
+Azimuth folder with FH2. Do not replace unrelated proxy DLLs blindly.
+
+Close Azimuth before replacing mod DLLs. Keep existing INI files, radio
+folders, Car Meets data and achievement records. Use one DLL per mod:
+do not keep renamed older DLLs alongside the update in fh3-mods.
+
+The updates were built locally and passed automated native-image startup,
+hook-sharing and regression tests. No new interactive driving/visual test
+of these v1.3.0 builds has been performed. The main game and saves were not
+modified. No release has been published to GitHub.
