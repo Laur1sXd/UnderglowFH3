@@ -1,0 +1,23 @@
+Save-specific Underglow setups (1.0.2, 17 November 2026)
+
+New offline/FH3MP careers start with no equipped Underglow on any player car.
+Equip a setup in Designs and Paints > UNDERGLOW for each car as usual.
+Equipped setups and Previous Underglows are isolated by a save-local identity,
+not by XUID, folder timestamps or a numeric garage ID alone. The identity is
+stored in the native profile database and travels with normal cloud save copies.
+It grants no colors/effects and does not equip Underglow.
+
+Old unscoped [Garage]/[GarageHistory] records remain in Underglow.ini, but are
+not automatically assigned to any save. Reapply desired setups after updating.
+This prevents a new career inheriting an old car's setup/history. If the active
+save cannot be identified, personal Underglow stays unequipped.
+
+Install: with Azimuth closed, replace fh3-mods/Underglow.dll using ONE edition.
+Keep the existing Underglow.ini; do not delete or alter your FH3 save files.
+
+Validation: all four editions rebuilt with warnings treated as errors. Native
+SQLite fixture tests cover separate saves, reused IDs, new careers, cloud-copy
+restore, persistence, saved slider/history isolation and stale preview blocking.
+Existing MODS Accept/Back/F9 regression tests pass in all four configurations.
+No rendered FH3/FH3MP session was performed for this change.
+The installed game/mod/saves were not modified. No GitHub assets were uploaded.

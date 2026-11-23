@@ -1,0 +1,50 @@
+Underglow Garage 1.0.2 - verified with official ANNA 1.0.2
+
+ANNA 1.0.2 keeps API 1 unchanged and now scrolls long submenus itself.
+All four Underglow editions keep Off and all fifteen audio effects together
+under Car > Underglow > Audio Visualizer > the equipped target.
+Use D-pad Up/Down: highlighting a scroll arrow moves the list, and moving
+past either end wraps around. D-pad Left goes back to the targets.
+No More Effects submenu or custom Next/Previous entries are inserted.
+The unfinished separate pagination proposal was not shipped.
+
+The production Underglow.dll files are byte-for-byte the existing tested
+all-edition API builds. No API-adapter change or game-memory hook is needed
+for ANNA 1.0.2. Mod version stays 1.0.2. This package refresh adds the new
+compatibility notes and reproducible real-DLL scrolling test to sources.
+
+Standalone editions use the official API when ANNA is installed/enabled,
+with native ANNA fallback when it is absent. ExtraOptions editions use the
+official API only. The standalone plugin menu has 87 entries; ExtraOptions
+has 88 because it also keeps Car > Lights > Underglow. Unavailable targets
+remain hidden and stale actions are rejected. Garage settings, save isolation,
+upgrade-hook compatibility, resident F9 Off/On and audio support are retained.
+
+IMPORTANT ANNA INSTALLATION DETAIL
+ANNA 1.0.2 adds media/UI/Controls/HUDAnnaControl.xaml next to its plugins folder.
+At the start of this check C:/Mano/Azimuth had the 1.0.2 DLL but was missing
+that media file. The official file has now been added with permission. Without it the scroll markers appear as plain text, not arrows.
+ANNA-1.0.2-Scroll-Media.zip contains the unmodified official file, with the
+mods/Forza Horizon 3/ANNA/media/UI/Controls/HUDAnnaControl.xaml path ready to
+extract into the Azimuth root. It is separate from the Underglow install ZIPs.
+Restart the game after completing ANNA's media installation.
+
+Every Underglow install ZIP contains only fh3-mods/Underglow.dll.
+Do not install multiple Underglow editions together. Keep settings and saves.
+Matching source ZIPs retain the UnderglowFH3 root and license/credit files.
+No ANNA.dll, Extra Options, Mod Platform, Groove, NoPause or Encore DLL is
+bundled or changed. The installed Underglow DLL and settings remain untouched.
+
+Validation: the actual installed, unmodified ANNA 1.0.2 DLL was initialized
+against an isolated fake game image. For all four editions it registered the
+official API entries, displayed the 16 audio choices in six-choice windows
+plus arrow rows, reached the last choice, wrapped Up/Down, applied the final
+effect only to the equipped target, and returned to targets on Back. All five
+targets were checked. Short lists stayed whole. Additional registration,
+visibility, stale-car/save, delayed-start and F9-worker checks also passed.
+These are real-DLL/native-memory fixtures, not a rendered in-game playtest.
+
+Build-Editions.cmd builds all four production variants.
+
+Official ANNA plugin/API and scrolling UI by Bartholomew Ho (qiangqiang101), MIT.
+https://github.com/qiangqiang101/FH3-ANNA/releases/tag/1.0.2
