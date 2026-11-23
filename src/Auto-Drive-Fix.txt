@@ -1,0 +1,30 @@
+Underglow Garage 1.0.2 - Auto Drive fix (23 November 2026)
+
+The local player car remains eligible for its equipped underglow in ANNA
+Auto Drive's AI-control mode 0 as well as manual-control mode 1. It must
+still have the player-car kind, a driver, the correct type, a supported mode
+and membership in the local simulation's car list. Unrelated cars, traffic,
+normal Drivatars, unknown modes and stale/unloaded ownership stay rejected.
+
+The presentation callback refreshes the pose from that validated owner,
+even if human-control ticks stop for longer than the old 750 ms cutoff.
+The glow follows the moving car and keeps its light and preset resources
+through manual > Auto Drive > manual. Existing part selection, colors,
+effects, brightness, speed, audio reaction and No Underglow remain in effect.
+
+All four Garage editions retain version 1.0.2, the official ANNA 1.0.2 API
+and automatic scrolling, the save-isolation/upgrade-hook fixes and existing
+Groove/HRN routes. No extra DLL is bundled. Each install ZIP still contains
+only fh3-mods/Underglow.dll. Install one matching edition with the game closed.
+Keep existing settings and saves. Installed game files were not changed.
+
+Validation: the regression failed before the change at the Auto Drive
+mode transition and passed afterward in all four configurations. Checks
+cover persistent lamp/preset ownership, a moving pose after tick expiry,
+audio reaction on only the selected part, No Underglow remaining off,
+manual-control return and rejection/cleanup of unrelated or stale cars.
+The existing Drivatar, meet, daylight and NPC radio fixtures passed in all
+four configurations. Production builds passed /W4 /WX and version/update-
+check metadata remained 1.0.2. These are isolated native-memory fixtures;
+a rendered Auto Drive gameplay test remains pending.
+
