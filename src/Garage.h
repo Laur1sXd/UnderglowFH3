@@ -1,7 +1,3 @@
-namespace anna {
-bool patchMarkup(std::string_view source, std::string& output);
-}
-
 // Per-car Garage setups and the native Designs & Paints entry point.
 namespace garage {
 constexpr int installColor = -1;
@@ -182,7 +178,7 @@ bool validEffects(unsigned effects) {
     if (effects > rgbMask) return false;
     for (size_t zone = 0; zone < zoneCount; ++zone) {
         const int effect = zoneEffect(effects, zone);
-        if (effect >= fx::kEffectCount || isAudioEffect(effect)) return false;
+        if (effect >= fx::kEffectCount) return false;
     }
     return true;
 }
@@ -773,6 +769,33 @@ bool setAudio(int effect, int zone) {
     return ok;
 }
 
+// From ANNA: the driven car's primary or secondary color. A car with no setup gets one (default glow, all parts).
+bool setActiveColor(bool secondary, int color) {
+    AcquireSRWLockShared(&garageLock);
+    const Id id = activeId;
+    ReleaseSRWLockShared(&garageLock);
+    return setColor(id, secondary, color);
+}
+
+// From ANNA: one effect, audio or visual, for one part (zone -1: all four). The other parts keep theirs.
+bool setEffect(int effect, int zone) {
+    if (effect < 0 || effect >= fx::kEffectCount || zone < -1 || zone >= static_cast<int>(zoneCount)) return false;
+    const auto sliders = sliderSnapshot();
+    AcquireSRWLockExclusive(&garageLock);
+    auto record = load(activeId);
+    bool ok = false;
+    if (activeId && record.state == State::installed) {
+        auto appearance = look(record);
+        // A color-only setup glows with the default effect on all four parts.
+        appearance.effects = changeEffect(appearance.effects ? appearance.effects : allEffects(fx::kEffectStatic),
+                                          effect, zone);
+        record.audio = 0;
+        ok = storeLook(activeId, record, appearance, sliders);
+    }
+    ReleaseSRWLockExclusive(&garageLock);
+    return ok;
+}
+
 bool toggleLights() {
     if (!supportExtraOptions) return false;
     AcquireSRWLockExclusive(&garageLock);
@@ -941,8 +964,7 @@ void loadMarkup(void* loader) {
     std::string replacement;
     const std::string_view source{text, static_cast<size_t>(length)};
     if (!patchDesigns(source, replacement) && !patchColorSelect(source, replacement) &&
-        !patchOptionsMarkup(source, replacement) &&
-        !anna::patchMarkup(source, replacement)) return;
+        !patchOptionsMarkup(source, replacement)) return;
     Byte* buffer = nullptr;
     native<Byte** (*)(Byte**, unsigned)>(0x208f320)(&buffer, static_cast<unsigned>(replacement.size() + 1));
     auto* data = buffer ? read<char*>(buffer + 0x28) : nullptr;
@@ -1202,9 +1224,9 @@ bool updateSwatch(Byte* item, int choice, SwatchColors colors, std::wstring_view
     return true;
 }
 
-enum Tab { primaryColors, secondaryColors, oneColorEffects, twoColorEffects, multicolorEffects, previous, tabCount };
+enum Tab { primaryColors, secondaryColors, oneColorEffects, twoColorEffects, multicolorEffects, audioEffects, previous, tabCount };
 constexpr const wchar_t* tabTitles[]{L"PRIMARY UNDERGLOW", L"SECONDARY UNDERGLOW", L"EFFECTS WITH 1 COLOR",
-    L"EFFECTS WITH 2 COLORS", L"MULTICOLOR EFFECTS", L"PREVIOUS UNDERGLOWS"};
+    L"EFFECTS WITH 2 COLORS", L"MULTICOLOR EFFECTS", L"AUDIO VISUALIZER", L"PREVIOUS UNDERGLOWS"};
 static_assert(std::size(tabTitles) == tabCount);
 constexpr std::wstring_view emptyHistoryMessage = L"There are no previous underglows for this car.";
 
@@ -1213,6 +1235,7 @@ bool isColorTab(int tab) {
 }
 
 int effectGroupForTab(int tab) {
+    if (tab == audioEffects) return fx::kGroupAudio;
     return tab >= oneColorEffects && tab <= multicolorEffects ? fx::kGroupOneColor + tab - oneColorEffects : -1;
 }
 

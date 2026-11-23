@@ -23,6 +23,7 @@
 
 #include "sdk/fh3mod.h"
 #include "sdk/FH3CarMeets.h"
+#include "fh3anna.h"
 #include "Edition.h"
 #include "Effects.h"
 #include "platform_menu.hpp"
@@ -1243,7 +1244,8 @@ void start();
 #include "Radio.h"
 
 void renderLights(Byte* manager, const Pool& presets, const Snapshot& frame, const Settings& settings,
-                  ULONGLONG animationTick, const World& owner = world, const fx::AudioFrame* carAudio = nullptr) {
+                  ULONGLONG animationTick, const World& owner = world, const fx::AudioFrame* carAudio = nullptr,
+                  bool previewing = false) {
     using Transform = void (*)(void*, Id, const XMFLOAT4*);
     using Intensity = void (*)(void*, Id, float, bool);
     const auto matrix = XMLoadFloat4x4(&frame.matrix);
@@ -1255,8 +1257,14 @@ void renderLights(Byte* manager, const Pool& presets, const Snapshot& frame, con
     XMStoreFloat4(&rotation, XMQuaternionMultiply(down, carRotation));
     const Color first = garage::resolvedColor(settings.options[Primary], settings.garageRgb);
     const Color second = garage::effectSecondary(first, garage::resolvedColor(settings.options[Secondary], settings.garageRgb));
-    const auto audio = carAudio ? *carAudio : radio::frame(GetTickCount64());
-    const bool radioPlaying = std::any_of(std::begin(audio.lvl), std::end(audio.lvl), [](float level) { return level > 0; });
+    const auto audioNow = GetTickCount64();
+    auto audio = carAudio ? *carAudio : radio::frame(audioNow);
+    bool radioPlaying = std::any_of(std::begin(audio.lvl), std::end(audio.lvl), [](float level) { return level > 0; });
+    // Your own car, with the radio silent (the Garage mutes it): show the audio effects on a made-up beat. Real audio wins.
+    if (!carAudio && !radioPlaying && (previewing || audioNow < radio::demoUntil.load())) {
+        audio = radio::demoFrame(audioNow);
+        radioPlaying = true;
+    }
     const float brightness = settings.sliders[Brightness];
     const fx::EffectFrame effects{settings.sliders[Speed], {first.r, first.g, first.b}, {second.r, second.g, second.b}, audio};
     const double seconds = effectSeconds(animationTick);
@@ -1440,7 +1448,8 @@ bool updateSceneLights(Byte* manager, const Settings& settings, bool animateInMe
         }
         if (world.lights.front() != invalid) {
             if (active) {
-                renderLights(manager, presets, frame, settings, animateInMenu ? now : frame.matrixTick);
+                renderLights(manager, presets, frame, settings, animateInMenu ? now : frame.matrixTick, world, nullptr,
+                             animateInMenu);
             } else {
                 // Keep the current car's lights ready to resume without recycling its GPU presets.
                 const auto setLevel = native<void (*)(void*, Id, float, bool)>(setIntensity);
@@ -1802,6 +1811,29 @@ bool installDaylightHooks() {
 
 #include "Anna.h"
 
+using InputFn = unsigned char (*)(void*, unsigned, unsigned, unsigned char);
+InputFn originalInput;
+
+unsigned char guardViewPress(void* input, unsigned context, unsigned action, unsigned char consume) {
+    const auto pressed = originalInput(input, context, action, consume);
+    // FH3's UI_BACK commands are View. B uses the separate UI_CANCEL commands.
+    // The Underglow picker stays alive while its Options or other dialogs are open.
+    constexpr unsigned uiContext = 7, viewPress = 0x57, viewRepeat = 0x59;
+    if (pressed && context == uiContext && action >= viewPress && action <= viewRepeat && garage::underglowPage) {
+        if (action == viewPress) log("Underglow ignored the View livery-save command.");
+        return 0;
+    }
+    return pressed;
+}
+
+bool installViewGuard() {
+    constexpr size_t input = 0x1a198f0;
+    if (std::memcmp(game + input, "\x48\x89\x5c\x24\x08", 5)) return false;
+    auto* hook = api->hook_function(mod, "Underglow View press guard", game + input,
+        reinterpret_cast<void*>(guardViewPress), reinterpret_cast<void**>(&originalInput));
+    return hook && enableOwnHook(hook);
+}
+
 using TrackDraw = void (*)(void*, const Byte*, void*);
 TrackDraw originalTrackDraw;
 
@@ -1892,8 +1924,8 @@ DWORD WINAPI installHooks(void*) {
     if (garage::install()) {
         log("Garage Underglow is ready in Designs and Paints.");
         if (!radio::install()) log("FH3 radio visualizer is unavailable. Audio effects will stay dark.");
-        if (anna::install()) log("ANNA audio effects are ready under Car > Underglow.");
-        else log("ANNA audio effects are unavailable on this game build.");
+        if (!installViewGuard()) log("The Underglow picker will not ignore View presses on this game build.");
+        anna::install();
     } else log("Garage Underglow stayed off because the garage menu hooks could not be installed.");
     if (platform) {
         if (supportHorizon3Extended) waitForExtendedSettings();
@@ -1927,6 +1959,7 @@ void shutdown() {
         CloseHandle(setupThread);
         setupThread = nullptr;
     }
+    anna::stop();
     npcRadio::stop();
     // Native resources belong to the game's render/audio threads. Their existing
     // hooks retire them there before the platform removes any detours.

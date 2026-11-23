@@ -17,10 +17,10 @@ Add neon underglow to your cars in Forza Horizon 3 on Azimuth. The mod uses the 
 
 | Where | What you can do |
 | --- | --- |
-| **Designs and Paints → Underglow** | Pick primary and secondary colors from 18 presets and 10 custom slots. Browse 46 visual effects and apply them to all parts or one part. |
+| **Designs and Paints → Underglow** | Pick primary and secondary colors from 18 presets and 10 custom slots. Browse 46 visual effects and 15 radio-reactive Audio Visualizer effects, and apply them to all parts or one part. |
 | **X (Options)** | Adjust brightness and, for animated effects, effect speed. The car previews the changes while you edit. |
 | **Previous Underglows** | Recall a setup with its colors, effect, placement, brightness, and speed. Press **X (Delete)** to manage equipped and previous setups. |
-| **ANNA → Car → Underglow → Audio Visualizer** | Choose from 15 effects that react to the car radio. Equip a setup in the Garage first. |
+| **ANNA → Car → Underglow → Audio Visualizer** | Change the 15 radio-reactive effects while driving, for all parts or one part. Equip a setup in the Garage first. Needs the [ANNA mod](https://github.com/qiangqiang101/FH3-ANNA). |
 | **ANNA → Car → Lights** | In the ExtraOptions edition, switch the equipped glow off or back on. |
 | **MODS → Installed mods → Underglow** | Switch the front, rear, left, and right lights individually. |
 
@@ -28,7 +28,7 @@ Highlight a swatch to preview it, then press **A (Apply)** to equip it. A fresh 
 
 ## How it works
 
-Underglow attaches lights to the local player's car. Version 1.0.1 also adds randomized setups for local and race Drivatars, independent NPC radio signals, and the compatible Car Meets mod's parked cars. Placement follows the fitted bumpers and side skirts when their bounds are available. The mod saves each car's appearance and history separately from its paint and livery. Audio effects read the active car-radio signal, and the ExtraOptions edition also supports Groove Music Radio.
+Underglow attaches lights to the local player's car. Version 1.0.1 also adds randomized setups for local and race Drivatars, independent NPC radio signals, and the compatible Car Meets mod's parked cars. Placement follows the fitted bumpers and side skirts when their bounds are available. The mod saves each car's appearance and history separately from its paint and livery. Audio effects read the active car-radio signal, and the Groove Music Radio mod's audio too when it is installed (both editions).
 
 ## Build from source
 
