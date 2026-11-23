@@ -1,5 +1,7 @@
 # Underglow for FH3
 
+This is the source for **Underglow 1.0.1**, matching the `v1.0.1` release.
+
 Add neon underglow to your cars in Forza Horizon 3 on Azimuth. The mod uses the game's lights to illuminate the road, and the Garage lets you preview and save a different setup for each car.
 
 [Effect catalog](docs/EFFECTS.md) · [Configuration](docs/CONFIGURATION.md) · [Build from source](#build-from-source)
@@ -26,7 +28,7 @@ Highlight a swatch to preview it, then press **A (Apply)** to equip it. A fresh 
 
 ## How it works
 
-Underglow attaches lights to the local player's car. Placement follows the fitted bumpers and side skirts when their bounds are available. The mod saves each car's appearance and history separately from its paint and livery. Audio effects read the active car-radio signal, and the ExtraOptions edition also supports Groove Music Radio.
+Underglow attaches lights to the local player's car. Version 1.0.1 also adds randomized setups for local and race Drivatars, independent NPC radio signals, and the compatible Car Meets mod's parked cars. Placement follows the fitted bumpers and side skirts when their bounds are available. The mod saves each car's appearance and history separately from its paint and livery. Audio effects read the active car-radio signal, and the ExtraOptions edition also supports Groove Music Radio.
 
 ## Build from source
 
@@ -46,3 +48,4 @@ Each command writes `src/build/Underglow.dll`. Both editions share the code in [
 - **FH3 ExtraOptions** by Bartholomew Ho provides the shared ANNA menus used by the ExtraOptions edition.
 
 For a bug report, include your edition, FH3 Mod Platform version, and steps to reproduce it. [Open an issue](https://github.com/Laur1sXd/UnderglowFH3/issues/new)
+
