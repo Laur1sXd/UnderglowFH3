@@ -13,7 +13,7 @@ if errorlevel 1 exit /b 1
 pushd "%~dp0"
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
 cd "%BUILD_DIR%"
-cl.exe /nologo /LD /std:c++17 /O2 /W4 /WX /EHsc /MT "%~dp0Underglow.cpp" "%~dp0pe.cpp" /link /OUT:Underglow.dll /DYNAMICBASE /NXCOMPAT
+cl.exe /nologo /LD /std:c++20 /O2 /W4 /WX /EHsc /MT "%~dp0Underglow.cpp" "%~dp0pe.cpp" /link /OUT:Underglow.dll /DYNAMICBASE /NXCOMPAT
 set "BUILD_RESULT=%ERRORLEVEL%"
 popd
 exit /b %BUILD_RESULT%
