@@ -229,6 +229,7 @@ SRWLOCK garageLock = SRWLOCK_INIT;
 Id activeId{};
 CarSetup activeRecord;
 std::atomic<bool> installed{};
+std::atomic<bool> runtimePageOpen{};
 using PageFn = void (*)(void*);
 PageFn originalDesignsLoaded, originalPaintOpen, originalPaintResume;
 PageFn originalColorItems, originalColorAccept, originalColorTab, originalResume, originalLeave;
@@ -1014,6 +1015,7 @@ void* copyPopup(PopupAction* from, void* to) {
 }
 
 void choose(PopupAction* action) {
+    if (stopping.load()) return;
     auto request = action->request;
     if (request.page != underglowPage || designCar(request.page) != request.id) return;
     auto* selected = native<Byte* (*)(void*)>(0x1607210)(action->popup);
@@ -1095,7 +1097,8 @@ void show(Request request) {
         body = L"Restore the colors and effects from this setup.";
         add(applyLook, L"Apply Underglow");
     }
-    add(back, L"Back");
+    // Effect placement uses the popup's existing B action to go back.
+    if (request.view != View::swatch || !effect) add(back, L"Back");
     if (!ok) { release(list); return; }
     auto* title = uiText(heading);
     auto* description = body.empty() ? nullptr : uiText(body);
@@ -1123,6 +1126,7 @@ void openStockPaint(void* page) {
 }
 
 void openUnderglowTile(void* page) {
+    if (stopping.load()) return;
     if (read<const Byte*>(page) != game + designsVtable) return;
     enterFromDesigns = designCar(page);
     if (!enterFromDesigns) return;
@@ -1541,6 +1545,7 @@ void colorItems(void* page) {
     const bool opening = openAtUnderglows == id;
     openAtUnderglows = 0;
     underglowPage = page;
+    runtimePageOpen = true;
     if (opening) {
         lastColorTab = primaryColors;
         helpForNoUnderglow = false;
@@ -1672,6 +1677,7 @@ void leaveColor(void* page) {
             log("Could not finish saving the Garage Underglow setup.");
         setPreview(0, installColor);
         underglowPage = nullptr;
+        runtimePageOpen = false;
         nextView = {};
         refreshPalette = false;
         returnFromRecall = false;
@@ -1786,8 +1792,8 @@ bool install() {
         const auto& hook = hooks[i];
         if (core::platform_menu::matches(game + hook.rva, hook.prefix, 6))
             enabled[i] = api->hook_function(mod, hook.name, game + hook.rva, hook.callback, hook.original);
-        if (!enabled[i] || !api->enable_hooks(mod, enabled[i])) {
-            while (i) api->disable_hooks(mod, enabled[--i]);
+        if (!enabled[i] || !enableOwnHook(enabled[i])) {
+            while (i) disableOwnHook(enabled[--i]);
             return false;
         }
     }

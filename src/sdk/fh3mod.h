@@ -33,7 +33,7 @@
 extern "C" {
 #endif
 
-#define FH3MOD_API_VERSION 9
+#define FH3MOD_API_VERSION 17
 
 #ifdef __cplusplus
 #define FH3MOD_EXPORT extern "C" __declspec(dllexport)
@@ -53,6 +53,7 @@ typedef struct FH3PageRow FH3PageRow;
 /* A title-screen entry (API 9), defined below FH3ModApi. */
 typedef struct FH3TitleEntry FH3TitleEntry;
 typedef struct FH3Hotkey FH3Hotkey;
+typedef struct FH3TuningRow FH3TuningRow;
 
 /* The CPU's registers at an instruction hook (API 7): see hook_instruction.
    rsp is what it was at the hooked instruction; changing it has no effect. */
@@ -99,6 +100,37 @@ typedef struct FH3ModInfo {
        ignore it. */
     int offline_only;
 } FH3ModInfo;
+
+/* ---- Custom upgrades (API 11, register_upgrade) ---- */
+typedef struct FH3UpgradeStage {
+    const wchar_t* name;          /* "Street Nitrous Kit" */
+    const wchar_t* description;
+    int32_t price;                /* credits; ignored for stage 0 (stock is free) */
+    const char* icon;             /* game path of the small icon, e.g. "GAME:\\Media\\UI\\Textures\\Data_Bound\\Upgrade_Parts\\Custom\\x_Icon.swatchbin"; NULL = the game's default */
+    const char* icon_large;       /* the large one, or NULL */
+} FH3UpgradeStage;
+/* Called (game thread) when the stage on a car is known or changes: the car being driven changed, or a stage was
+   installed. `garage` is the car's garage id. Keep it short and non-blocking. */
+typedef void (*FH3UpgradeStageFn)(void* user, uint32_t garage, int stage);
+typedef struct FH3UpgradeDef {
+    uint32_t size;                /* sizeof(FH3UpgradeDef) */
+    const char* id;               /* stable key of this upgrade, e.g. "nitrosystem2.kit" (letters, digits, '.', '_') */
+    const wchar_t* name;          /* the type's name: "Nitrous Kit" */
+    const wchar_t* description;
+    int32_t area;                 /* UpgradeAreas id: 1 Engine (0 = 1), 4 Tires and rims, 8 Conversion */
+    const char* icon;             /* the type's icons (game paths) or NULL */
+    const char* icon_large;
+    int32_t stage_count;          /* 2 to 10, stage 0 is stock */
+    const FH3UpgradeStage* stages;
+    FH3UpgradeStageFn on_stage;   /* may be NULL */
+    void* user;
+    int32_t preferred_slot;       /* -1 = any; a mod moving its old upgrade over asks for the slot it had (0 = the first) */
+    /* (platform 1.0.0, API 12; may be left out: a definition without it is accepted)
+       the game part whose shop camera this upgrade's list uses, as its part enum: 10 front rims, 11 rear rims,
+       8 tire compound, 38/39 front/rear tire width, ...; 0 = the area's default camera */
+    int32_t camera_part;
+} FH3UpgradeDef;
+#define FH3_UPGRADEDEF_SIZE_V11 ((uint32_t)offsetof(FH3UpgradeDef, camera_part))
 
 typedef struct FH3ModApi {
     uint32_t size;                /* sizeof(FH3ModApi) as the platform knows it */
@@ -504,7 +536,123 @@ typedef struct FH3ModApi {
        run one at a time, on the platform's command thread (see
        FH3CommandFn). Returns 1 if added, 0 if not (the log says why). */
     int (*add_command)(FH3Mod* mod, const char* name, const char* help, FH3CommandFn fn, void* user);
+
+    /* ==== API version 10: check api_version >= 10 ======================== */
+
+    /* Add a string to one of the game's database-backed string tables (Upgrades.str, UpgradeTypes.str, ... -
+       the ones whose keys are 32-bit hashes, not the small numbers set_string takes), under a key of your
+       choosing (pick something unlikely to clash, e.g. a hash of your mod and text; a key the table already
+       has is left alone). Written like set_string (every language, applied after fh3mod_init, shows from
+       the next launch). The database refers to the text as "_&" followed by the decimal of
+       ((uint64_t)table_hash << 32) | key; FH3_TABLE_UPGRADES and FH3_TABLE_UPGRADETYPES are the table hashes
+       of the two tables upgrade names and descriptions live in. */
+    void (*add_string_key)(FH3Mod* mod, const char* table, uint32_t key, const wchar_t* text);
+    /* ==== API version 11: check api_version >= 11 ======================== */
+
+    /* Custom upgrades (the upgrade bridge). A mod describes an upgrade type (name, description, icons, area, stages
+       with names, descriptions and prices) and the platform does the rest: it hands out the ids (part enum, type,
+       upgrade and part ids; remembered by `id` in fh3-mods\platform-upgrades.ini), writes the database rows and
+       the texts, shows the type in Garage > Upgrades, runs the basket, purchase and "install this setup?" prompt,
+       and remembers each car's stage and owned stages. Stage 0 is the stock stage: always owned and fitted on
+       every car until another stage is bought. Call from fh3mod_init. Returns a handle (>= 0) or -1 (the log
+       says why). Up to 8 upgrades in all, up to 10 stages each. */
+    int (*register_upgrade)(FH3Mod* mod, const FH3UpgradeDef* def);
+    /* The stage fitted on the car with that garage id (0 = stock), or on the car being driven if garage <= 0 (0 when
+       the car being driven isn't one of the player's, a loaner; from API 14 the platform follows the player's car
+       itself, so a car switch at an event's car select or a loaner needs nothing from the mod). */
+    int (*upgrade_stage)(FH3Mod* mod, int handle, int32_t garage);
+    /* The garage id of the car being driven (0 = not known yet, or, from API 14, the driven car isn't one of the
+       player's). The stage callbacks run with garage 0, stage 0 when the player gets into such a car. */
+    uint32_t (*upgrade_active_garage)(void);
+    /* One-time move of a mod's own earlier per-car data to the platform: car `garage` (model `ordinal`, 0 if not
+       known) had `stage` fitted and owns the stages whose bits are set in `owned_mask` (bit n = stage n). */
+    void (*upgrade_import)(FH3Mod* mod, int handle, int32_t garage, int32_t ordinal, int stage, uint32_t owned_mask);
+    /* ==== API version 12: check api_version >= 12 ======================== */
+
+    /* The model (car ordinal, the number in the game's car spec) the platform has recorded for the car with that
+       garage id, or 0 if it doesn't know yet (it learns it when the car is seen in the upgrade shop). A mod
+       can compare it with the model of the car it finds being driven: when they differ, the game has put the
+       player in another car (a loaner in a mission), and the garage car's upgrades don't apply. */
+    int32_t (*upgrade_car_model)(int32_t garage);
+    /* ==== API version 13: check api_version >= 13 ======================== */
+
+    /* A slider row of your own on a page of the garage's tuning menu (Springs: after Ride Height), laid out like the
+       game's own tuning sliders. The row is written into the page when the tuning menu is built, so add rows from
+       fh3mod_init. See FH3TuningRow. Returns 1 if added, 0 if not (the log says why). Up to 64 rows in all (the page scrolls). */
+    int (*add_tuning_row)(FH3Mod* mod, const struct FH3TuningRow* row);
+    /* ==== API version 14: check api_version >= 14 ======================== */
+
+    /* Which of the player's cars is a car with this Data_Car id (the number in the car's spec, model * 1000 + variant,
+       or the model itself)? Returns its garage id, or 0 when it isn't one of the player's cars (a mission loaner, an
+       AI car). The driven car's garage id wins when it is that model; otherwise the player's car of that model the
+       game read last (within a minute: an event's car select reads the chosen car), or, with FH3MOD_CAR_IS_PLAYERS,
+       the player's car of that model even without such a read. FH3MOD_CAR_MAKE_DRIVEN makes the answer the driven
+       car (upgrade_active_garage, the stage callbacks run). Use it when the game builds or drives a car: the driven
+       garage id the platform learns from the game's statements can lag behind a car switch by several seconds.
+       Called while the game builds a car (from a hook in the car loader), it also answers whether that car is the
+       player's: an AI car of the player's model (a one-make race) gets 0, so it gets none of the player's upgrades. */
+    int32_t (*upgrade_garage_for_car)(int32_t car_id, uint32_t flags);
+    /* The stage of your upgrade on a car the game builds, by the car's Data_Car id: the stage of the player's car of
+       that model (see upgrade_garage_for_car; it becomes the driven car), 0 when it isn't one of the player's cars.
+       The call for a mod that changes a car while the game builds it (wheel spacers: the car's track). */
+    int (*upgrade_stage_for_car)(FH3Mod* mod, int handle, int32_t car_id);
+    /* ==== API version 15: check api_version >= 15 ======================== */
+
+    /* The stage of your upgrade the garage's upgrade list is showing on the car right now (the cursor is on it), or -1
+       when none is: the cursor is on something else or has left the list, the stage was put in the basket or the setup
+       was installed or abandoned. Unlike upgrade_stage's preview, which answers for 300 ms after each cursor move for the
+       rebuild the game starts, this one stays while the cursor stays. For a mod that shows something on the car for as
+       long as the player looks at the stage (the Airride lowers the car 3 cm). Any thread. */
+    int (*upgrade_preview_stage)(FH3Mod* mod, int handle);
+    /* A number that goes up with every step the garage's upgrade list takes on the car (each cursor move shows a stage again). The game
+       gives no sign when the player backs out of the list (upgrade_preview_stage stays), so a mod that ends its preview itself (on the
+       back button) keeps it ended until this changes: the next hover. */
+    uint32_t (*upgrade_shop_serial)(void);
+
+    /* ==== API version 16 (platform 1.2.0): check api_version >= 16 ===== */
+
+    /* ---- Hot reload (a developer feature) ----------------------------------
+       With fh3-mods\platform.ini [dev] HotReload=1, the platform loads every mod from a copy, so a rebuilt DLL can replace the
+       file while the game runs, and F9 swaps in the DLLs that changed. A mod takes part by exporting
+
+           FH3MOD_EXPORT void fh3mod_shutdown(void);
+
+       which the platform calls (on a thread of its own, never a game thread) before it loads the new build. It has to stop what the
+       mod started: its threads (and wait for them to end), timers, anything it patched by itself. The platform switches the mod's
+       hooks off after it returns, loads the new DLL and calls its fh3mod_init again. The old DLL stays in memory for good (code
+       that is still running in it, or a pointer someone kept, never lands on unmapped memory). A mod without fh3mod_shutdown is
+       left running as it is and needs a restart to change.
+       During that second fh3mod_init, register_mod returns the same handle, and calls that add rows, pages, hotkeys, commands,
+       upgrades or tuning rows with a key that exists already swap the callbacks and `user` pointers of that entry (nothing is
+       added twice); the data the game reads at startup (text, files, SQL, the rows' labels, upgrade stages and prices) is
+       not applied again: a change to it shows after a restart. is_reloading() tells the second run from the first. */
+    int (*is_reloading)(void);   /* 1 while your fh3mod_init runs as a reload, else 0 */
 } FH3ModApi;
+
+#define FH3MOD_CAR_MAKE_DRIVEN 1u   /* upgrade_garage_for_car: make the car found the driven car */
+#define FH3MOD_CAR_IS_PLAYERS  2u   /* upgrade_garage_for_car: the caller knows this is the car the player drives */
+
+/* One slider row on the tuning menu (API 13). All callbacks run on the game's UI thread: keep them short, don't call
+   into the game from them. */
+struct FH3TuningRow {
+    uint32_t size;                 /* sizeof(FH3TuningRow) */
+    const char* key;               /* unique within your mod: letters, digits and '_' */
+    const char* label;             /* UTF-8, at the left of the row: "Airride drop (cm)"; "Airride|Drop (cm)" = header band "AIRRIDE", row "Drop", unit cm */
+    const char* help;              /* UTF-8, the description shown while the row is selected; may be NULL */
+    float min, max, step;          /* the slider's range and step */
+    int decimals;                  /* digits after the point in the number at the right */
+    float (*get)(void* user);      /* the value to show for the car being tuned */
+    void (*set)(void* user, float value);   /* the player moved the slider (already on a step, inside the range) */
+    int (*visible)(void* user);    /* 1 = show the row for the car being tuned, 0 = hide it; may be NULL (always shown) */
+    void* user;                    /* passed to every callback */
+
+    /* ---- API 17 (platform 1.4.0) ---- */
+    const char* page;              /* the tab the row is on: "Engine" = a tab of its own, ENGINE, after Differential
+                                      (the platform adds it when a row asks for it); NULL = the end of Springs */
+};
+
+#define FH3_TABLE_UPGRADES 0x968719E9u      /* Upgrades.str: Upgrades.Name / Description */
+#define FH3_TABLE_UPGRADETYPES 0x07710821u  /* UpgradeTypes.str: UpgradeTypes.Name / Description */
 
 /* Called on the game's UI thread when the player changes a row: keep it
    short (save the value, flip a flag), and don't call back into the game. */
@@ -698,6 +846,7 @@ struct FH3PageRow {
 
 /* What a mod exports. */
 typedef int (*FH3ModInitFn)(const FH3ModApi* api);
+typedef void (*FH3ModShutdownFn)(void);   /* optional, API 16: lets the mod be hot-reloaded (see is_reloading) */
 
 #ifdef __cplusplus
 }

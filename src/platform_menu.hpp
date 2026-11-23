@@ -7,6 +7,21 @@
 
 namespace core::platform_menu {
 
+// Optional host extension: explicit callbacks remove dependency on its linker
+// layout. Stock platforms continue through the checked layouts below.
+struct SettingsPreviewV1 {
+    uint32_t size, version;
+    void* (*page)(const void* mod);
+    int (*selected)();
+    void* buttons;
+    void* row_set;
+    void* selection_set;
+    void (*notify)(void* model, void* descriptor);
+    void* (*load_row)(const void* mod);
+    void* (*model)();
+    void* (*notice)();
+};
+
 struct PlatformMenu {
     uint32_t stamp, size;
     uint32_t button, row_get, row_set, notify, rows, installed_page, view, entries, in_hub;
@@ -20,6 +35,22 @@ struct PlatformMenu {
 
 // These checked Mod Platform builds use the same ModEntry layout.
 inline constexpr PlatformMenu menus[] = {
+    // Official Mod Platform 1.4.2 / DINPUT8.dll (API 17).
+    {0x6af85a9e, 0x26b000, 0xda1a0, 0xdfd40, 0xdfe70, 0xbc420, 0x241248,
+     0x2362c0, 0x2412a8, 0x241da0, 0x2418a0, 0, 0, 0, 0,
+     "\x41\x57\x41\x56\x41\x55\x41\x54\x56\x57\x55\x53",
+     "\x41\x57\x41\x56\x41\x54\x56\x57\x53\x48",
+     "\x56\x57\x53\x48\x83\xec\x30\x48\x89\xce",
+     "\x41\x57\x41\x56\x41\x55\x41\x54\x56\x57\x55\x53",
+     "\x55\x56\x57\x53\x48\x81\xec\xc8\x00\x00\x00"},
+    // Official Mod Platform 1.3.0 / DINPUT8.dll (API 16).
+    {0x6af5f686, 0x26a000, 0xd93c0, 0xde3b0, 0xde4e0, 0xbb650, 0x240210,
+     0x235280, 0x240268, 0x240d60, 0x240860, 0xbe170, 0x234778, 0x240340, 0x235790,
+     "\x41\x57\x41\x56\x41\x55\x41\x54\x56\x57\x55\x53",
+     "\x41\x57\x41\x56\x41\x54\x56\x57\x53\x48",
+     "\x56\x57\x53\x48\x83\xec\x30\x48\x89\xce",
+     "\x41\x57\x41\x56\x41\x55\x41\x54\x56\x57\x55\x53",
+     "\x55\x56\x57\x53\x48\x81\xec\xc8\x00\x00\x00"},
     {0x6aee7575, 0x253000, 0xc80c0, 0xcd0b0, 0xcd1e0, 0xaa0f0, 0x229ff8,
      0x21f150, 0x22a048, 0x22aad0, 0x22a5e8, 0xace70, 0x21e698, 0x22a100, 0x21f620,
      "\x41\x57\x41\x56\x41\x55\x41\x54\x56\x57\x55\x53",

@@ -46,6 +46,8 @@ bool reportedTracks{}, reportedGroove{}, heardTracks{}, heardGroove{};
 SRWLOCK sampleLock = SRWLOCK_INIT;
 fx::AudioFrame sample;
 bool samplePaused{};
+bool reportedMeetAudio{};
+float meetLow{1}, meetHigh{};
 
 void holdForPause(ULONGLONG now) {
     AcquireSRWLockExclusive(&sampleLock);
@@ -76,6 +78,18 @@ void publish(ULONGLONG now, bool playing) {
         }
     }
     ReleaseSRWLockExclusive(&sampleLock);
+    if (liveMeetAudio(now)) {
+        const float level = *std::max_element(tap.levels.begin(), tap.levels.end());
+        meetLow = std::min(meetLow, level);
+        meetHigh = std::max(meetHigh, level);
+        if (!reportedMeetAudio && meetHigh - meetLow > .02f && meetHigh > .05f) {
+            log("Car Meet visualizer is receiving changing live music levels.");
+            reportedMeetAudio = true;
+        }
+    } else {
+        reportedMeetAudio = false;
+        meetLow = 1; meetHigh = 0;
+    }
 }
 
 fx::AudioFrame frame(ULONGLONG now) {
@@ -146,7 +160,10 @@ bool connect(ULONGLONG now, Route route) {
         if (tap.group == group && dsp == tap.fft) return tap.connected = true;
         if (!groove && hasName(dsp, "FMOD Fader")) position = i + 1;
     }
-    if (tap.fft) native<Release>(0x27c5710)(tap.fft);
+    if (tap.fft) {
+        if (tap.group) native<int (*)(void*, void*)>(0x27c26f0)(tap.group, tap.fft);
+        native<Release>(0x27c5710)(tap.fft);
+    }
     tap.fft = tap.group = nullptr;
 
     void* core = nullptr;
@@ -166,6 +183,7 @@ bool connect(ULONGLONG now, Route route) {
     tap.window = window >= 64 && window <= 16384 ? window : 2048;
     tap.rate = rate >= 8000 && rate <= 192000 ? rate : 48000;
     tap.fft = fft;
+    audioCleanupDone = false;
     tap.group = group;
     tap.peaks = {};
     tap.levels = {};
@@ -176,33 +194,33 @@ bool connect(ULONGLONG now, Route route) {
     return tap.connected = true;
 }
 
-bool measureLevels(ULONGLONG now, const std::array<float, zoneCount>& raw) {
+bool measureLevels(ULONGLONG now, const std::array<float, zoneCount>& raw, Tap& source = tap) {
     const bool sound = *std::max_element(raw.begin(), raw.end()) > 1e-7f;
-    if (sound) tap.heard = now;
-    else if (tap.heard && now - tap.heard < 200) return true;
-    else tap.levels = {};
+    if (sound) source.heard = now;
+    else if (source.heard && now - source.heard < 200) return true;
+    else source.levels = {};
 
-    const float dt = tap.last ? static_cast<float>(now - tap.last) * 0.001f : 0.016f;
-    tap.last = now;
+    const float dt = source.last ? static_cast<float>(now - source.last) * 0.001f : 0.016f;
+    source.last = now;
     for (size_t i = 0; i < zoneCount; ++i) {
-        tap.peaks[i] = std::max(raw[i], tap.peaks[i] * std::exp(-dt * 0.25f));
-        const float target = tap.peaks[i] > 1e-8f ? std::clamp((raw[i] / tap.peaks[i] - 0.15f) / 0.85f, 0.0f, 1.0f) : 0;
-        tap.levels[i] = target >= tap.levels[i] ? target : target + (tap.levels[i] - target) * std::exp(-dt * 7.0f);
+        source.peaks[i] = std::max(raw[i], source.peaks[i] * std::exp(-dt * 0.25f));
+        const float target = source.peaks[i] > 1e-8f ? std::clamp((raw[i] / source.peaks[i] - 0.15f) / 0.85f, 0.0f, 1.0f) : 0;
+        source.levels[i] = target >= source.levels[i] ? target : target + (source.levels[i] - target) * std::exp(-dt * 7.0f);
     }
     return sound;
 }
 
-bool measure(ULONGLONG now) {
+bool measure(ULONGLONG now, Tap& source = tap) {
     void* data = nullptr;
     unsigned size = 0;
     if (native<int (*)(void*, int, void**, unsigned*, char*, int)>(0x27c5100)(
-        tap.fft, spectrumParameter, &data, &size, nullptr, 0) || !data) return false;
+        source.fft, spectrumParameter, &data, &size, nullptr, 0) || !data) return false;
     Spectrum fft;
     if (size < sizeof(fft) || !read(data, fft) || fft.length < 32 || fft.length > 16384 ||
         fft.channels < 1 || fft.channels > 32) return false;
 
-    const int count = std::min(fft.length, tap.window / 2);
-    const float hz = static_cast<float>(tap.rate) / static_cast<float>(tap.window);
+    const int count = std::min(fft.length, source.window / 2);
+    const float hz = static_cast<float>(source.rate) / static_cast<float>(source.window);
     constexpr float bands[zoneCount][2]{{3000, 12000}, {800, 3000}, {30, 160}, {160, 800}};
     std::array<float, zoneCount> raw{};
     for (int channel = 0; channel < fft.channels; ++channel) {
@@ -220,14 +238,14 @@ bool measure(ULONGLONG now) {
             raw[zone] += total / static_cast<float>((high - low + 1) * fft.channels);
         }
     }
-    if (*std::max_element(raw.begin(), raw.end()) > 1e-7f) {
-        const bool groove = supportExtraOptions && tap.route == Route::groove;
+    if (&source == &tap && *std::max_element(raw.begin(), raw.end()) > 1e-7f) {
+        const bool groove = supportExtraOptions && source.route == Route::groove;
         bool& heard = groove ? heardGroove : heardTracks;
         if (!heard) log(groove ? "Radio visualizer received Groove Music audio." :
             "Radio visualizer received car radio audio.");
         heard = true;
     }
-    return measureLevels(now, raw);
+    return measureLevels(now, raw, source);
 }
 
 bool audibleGroove() {
@@ -272,11 +290,29 @@ bool pauseMenuActive() {
 
 void tick(void* manager, float dt) {
     originalTick(manager, dt);
+    if (stopping.load()) {
+        __try {
+            npcRadio::cleanupNative();
+            const auto* engine = read<Byte*>(game + engineGlobal);
+            void* studio = engine ? read<void*>(engine + 0xa9fe8) : nullptr;
+            if (tap.fft && studio && studio == tap.studio) {
+                if (tap.group) native<int (*)(void*, void*)>(0x27c26f0)(tap.group, tap.fft);
+                native<Release>(0x27c5710)(tap.fft);
+            }
+            tap = {};
+            audioCleanupDone = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Do not report a successful shutdown while native handles remain.
+        }
+        return;
+    }
     const auto now = GetTickCount64();
+    npcRadio::nativeTick(now);
     __try {
         // FH3 can mute the radio while the pause menu is drawing over free roam.
         // Keep the last rendered audio levels until the native menu closes.
-        if (pauseMenuActive()) {
+        const bool inMeet = liveMeetAudio(now);
+        if (pauseMenuActive() && !inMeet) {
             holdForPause(now);
             return;
         }
@@ -285,7 +321,9 @@ void tick(void* manager, float dt) {
 #endif
         if (tap.faulted) return;
         const auto route = currentRoute(static_cast<const Byte*>(manager));
-        if (route == Route::tracks) {
+        if (route == Route::tracks || (inMeet && route == Route::off)) {
+            // The meet's 2D radio can remain audible when the free-roam
+            // driver's station flags are inactive. Measure the actual bus.
             publish(now, connect(now, route) && measure(now));
         } else if (supportExtraOptions && connect(now, Route::groove) && audibleGroove() && measure(now)) {
             // Groove has its own streaming player. The stock station can be
@@ -318,6 +356,6 @@ bool install() {
         inPauseMenu = native<unsigned char (*)()>(pauseMenuRva);
     auto* hook = api->hook_function(mod, "FH3 car radio visualizer", game + tickRva,
         reinterpret_cast<void*>(tick), reinterpret_cast<void**>(&originalTick));
-    return hook && api->enable_hooks(mod, hook);
+    return hook && enableOwnHook(hook);
 }
 } // namespace radio

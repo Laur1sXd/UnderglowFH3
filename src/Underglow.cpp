@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
@@ -17,8 +18,11 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include <filesystem>
+#include <fstream>
 
 #include "sdk/fh3mod.h"
+#include "sdk/FH3CarMeets.h"
 #include "Edition.h"
 #include "Effects.h"
 #include "platform_menu.hpp"
@@ -30,7 +34,7 @@ using Byte = unsigned char;
 using Id = uint32_t;
 constexpr Id invalid = UINT32_MAX;
 constexpr char modName[] = "Underglow";
-constexpr char modVersion[] = "1.0.0";
+constexpr char modVersion[] = "1.0.1";
 constexpr char modDescription[] = "Customize per-car Underglow in Designs and Paints.";
 
 // Xbox One Opus 1.0.125.0, as mapped by Azimuth.
@@ -38,6 +42,7 @@ constexpr DWORD timestamp = 0x5b16ecca;
 constexpr DWORD imageSize = 0x5495000;
 constexpr size_t playerTickCall = 0x18b8e16;
 constexpr size_t carLightsCall = 0x1e7d0f1;
+constexpr size_t drivatarPresentationTick = 0x34446e;
 constexpr size_t sceneLightsCall = 0x1d9c7de;
 constexpr size_t uploadLightsCall = 0x1d9c804;
 constexpr size_t copyLightPacketCall = 0x1b6a617;
@@ -141,6 +146,50 @@ Byte* game;
 wchar_t ini[MAX_PATH];
 SRWLOCK iniWriteLock = SRWLOCK_INIT;
 SRWLOCK settingsLock = SRWLOCK_INIT;
+std::atomic<bool> modEnabled{true};
+std::atomic<bool> stopping{}, sceneCleanupDone{true}, audioCleanupDone{true};
+HANDLE stopEvent{}, setupThread{};
+SRWLOCK shutdownLock = SRWLOCK_INIT;
+std::vector<FH3Hook*> ownHookTargets;
+std::atomic<bool> setupComplete{}, setupTouched{};
+
+int enableOwnHook(FH3Hook* hook) {
+    if (!hook || !api->enable_hooks(mod, hook)) return 0;
+    if (std::find(ownHookTargets.begin(), ownHookTargets.end(), hook) == ownHookTargets.end())
+        ownHookTargets.push_back(hook);
+    return 1;
+}
+
+int disableOwnHook(FH3Hook* hook) {
+    if (!hook || !api->disable_hooks(mod, hook)) return 0;
+    ownHookTargets.erase(std::remove(ownHookTargets.begin(), ownHookTargets.end(), hook), ownHookTargets.end());
+    return 1;
+}
+
+bool switchOwnHooks(bool enabled) {
+    bool ok = true;
+    for (auto* hook : ownHookTargets)
+        ok = (enabled ? api->enable_hooks(mod, hook) : api->disable_hooks(mod, hook)) && ok;
+    if (!ok && enabled) for (auto* hook : ownHookTargets) api->disable_hooks(mod, hook);
+    return ok;
+}
+
+bool stopWait(DWORD milliseconds) {
+    return stopping.load() || (stopEvent && WaitForSingleObject(stopEvent, milliseconds) == WAIT_OBJECT_0);
+}
+
+bool loaderRequestedOn(const wchar_t* root) {
+    std::ifstream file(std::filesystem::path(root) / L"fh3-mods/platform-disabled.txt");
+    std::string line;
+    while (std::getline(file, line)) {
+        const auto first = line.find_first_not_of(" \t\r");
+        if (first == line.npos || line[first] == '#') continue;
+        const auto last = line.find_last_not_of(" \t\r");
+        const auto name = line.substr(first, last - first + 1);
+        if (!_stricmp(name.c_str(), "Underglow.dll")) return false;
+    }
+    return true;
+}
 Settings savedSettings, draftSettings;
 struct RowBinding {
     void* descriptor{};
@@ -160,12 +209,27 @@ std::array<std::array<int, fx::kEffectCount>, fx::kGroupCount> effectIds{};
 std::array<uint32_t, fx::kGroupCount> effectChoiceCounts{};
 
 const core::platform_menu::PlatformMenu* platformMenu;
+const core::platform_menu::SettingsPreviewV1* settingsPreviewApi;
 constexpr size_t entrySize = 0xb0;
 constexpr size_t entryMod = 0xa0;
 constexpr int acceptButton = 0xf4240;
 constexpr int backButton = 0xf423f;
 const Byte* platform;
 std::atomic<bool> menuReady{};
+// Menu hooks remain resident during the mod's internal Off state. They own no
+// lights/audio and must still update the loader's pending-change notice.
+std::atomic<int> appliedLoadNotice{-1};
+using MenuUpdate = void (*)(void*);
+MenuUpdate originalMenuUpdate;
+RowBinding noticeBinding;
+bool noticeRefreshPending{};
+struct LoadPreview {
+    Byte* row{};
+    void* page{};
+    int selected{}, accepted{}, boot{};
+};
+LoadPreview loadPreview;
+std::atomic<unsigned> loadWriteEpoch{};
 using MenuButtons = bool (*)(void*, int, bool);
 using SetProperty = void (*)(void*, void*, void*);
 using NotifyProperty = void (*)(void*, void*);
@@ -248,6 +312,16 @@ struct Snapshot {
 SRWLOCK snapshotLock = SRWLOCK_INIT;
 Snapshot snapshot;
 
+struct MeetSnapshot {
+    Snapshot pose{};
+    FH3MeetAppearance appearance{};
+};
+std::array<MeetSnapshot, FH3_CAR_MEETS_SLOTS> meetSnapshots{};
+std::atomic<const FH3CarMeetsV1*> meetProvider{};
+std::atomic<ULONGLONG> meetAudioUntil{};
+
+bool liveMeetAudio(ULONGLONG now) { return now <= meetAudioUntil.load(); }
+
 struct World {
     Byte* manager{};
     Byte* lightPool{};
@@ -255,6 +329,7 @@ struct World {
     std::array<Id, lightCount> presets{};
     std::array<Id, lightCount> lights{};
     std::array<Id, lightCount> generations{};
+    std::array<uint64_t, lightCount> presetNames{};
     ULONGLONG retryAfter{};
     bool reportedActive{};
     bool reportedCapacity{};
@@ -263,7 +338,21 @@ struct World {
 };
 // The scene callback is the only code that changes the light pools.
 World world;
+std::array<World, FH3_CAR_MEETS_SLOTS> meetWorlds{};
+std::array<uint64_t, FH3_CAR_MEETS_SLOTS> meetIdentities{};
+constexpr size_t maxDrivatars = 64;
+struct DrivatarSnapshot {
+    Snapshot pose{};
+    Byte* driver{};
+    uint64_t identity{};
+};
+std::array<DrivatarSnapshot, maxDrivatars> drivatarSnapshots{};
+std::array<World, maxDrivatars> drivatarWorlds{};
+std::array<uint64_t, maxDrivatars> drivatarIdentities{};
+uint64_t drivatarSequence = GetTickCount64();
+constexpr size_t maxOwnedLights = lightCount * (FH3_CAR_MEETS_SLOTS + maxDrivatars);
 SRWLOCK worldLock = SRWLOCK_INIT;
+std::atomic<uint64_t> presetSequence{(GetTickCount64() << 12) ^ reinterpret_cast<uintptr_t>(&world)};
 
 template<class T> bool read(const void* address, T& value) {
     __try {
@@ -399,6 +488,7 @@ void loadPalette() {
 }
 
 void* optionsPage() {
+    if (settingsPreviewApi) return menuReady.load() ? settingsPreviewApi->page(mod) : nullptr;
     if (!menuReady.load() || !read<Byte>(platform + platformMenu->in_hub)) return nullptr;
     const auto page = read<void*>(platform + platformMenu->installed_page);
     const int view = read<int>(platform + platformMenu->view);
@@ -450,6 +540,7 @@ RowBinding discardDraft() {
 }
 
 int selectedRow() {
+    if (settingsPreviewApi) return settingsPreviewApi->selected();
     return read<int>(selectedRowAddress);
 }
 
@@ -457,11 +548,149 @@ void refreshRow(RowBinding row) {
     if (!row.model || !row.descriptor) return;
     const bool wasRefreshing = refreshingRow;
     refreshingRow = true;
-    notifyProperty(row.model, row.descriptor);
+    __try {
+        notifyProperty(row.model, row.descriptor);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        log("A replaced settings binding was skipped; its current view will refresh normally.");
+    }
     refreshingRow = wasRefreshing;
 }
 
+Byte* loadNoticeRow() {
+    if (settingsPreviewApi && settingsPreviewApi->load_row)
+        return static_cast<Byte*>(settingsPreviewApi->load_row(mod));
+    // Checked libc++ Row/deque layout in official 1.4.2. Resolve our entry by
+    // FH3Mod identity rather than list position; other mods can add any rows.
+    if (!platformMenu || platformMenu->stamp != 0x6af85a9e) return nullptr;
+    const auto begin = read<uintptr_t>(platform + platformMenu->entries);
+    const auto end = read<uintptr_t>(platform + platformMenu->entries + 8);
+    if (!begin || end < begin || (end - begin) % entrySize || end - begin > entrySize * 4096) return nullptr;
+    size_t entry = 0;
+    for (; entry < (end - begin) / entrySize; ++entry)
+        if (read<FH3Mod*>(reinterpret_cast<const Byte*>(begin + entry * entrySize + entryMod)) == mod) break;
+    if (entry == (end - begin) / entrySize) return nullptr;
+    const auto key = "Mod_" + std::to_string(entry);
+    const auto* deque = platform + platformMenu->rows;
+    const auto blocks = read<uintptr_t>(deque + 8);
+    const auto blocksEnd = read<uintptr_t>(deque + 16);
+    const auto start = read<size_t>(deque + 32);
+    const auto count = read<size_t>(deque + 40);
+    constexpr size_t rowSize = 0xd0, blockSize = 4096 / rowSize;
+    if (!blocks || blocksEnd < blocks || count > 4096 || start > 4096) return nullptr;
+    for (size_t i = 0; i < count; ++i) {
+        const size_t slot = start + i, block = slot / blockSize;
+        if ((block + 1) * 8 > blocksEnd - blocks) return nullptr;
+        auto* row = read<Byte*>(reinterpret_cast<const Byte*>(blocks + block * 8));
+        if (!row) return nullptr;
+        row += (slot % blockSize) * rowSize;
+        if (!core::pe::readable(row, rowSize)) return nullptr;
+        // Mod_<index> is always a short libc++ string. Do not match a mod's
+        // similarly named setting or the separate online-load switch.
+        if (read<Byte>(row + 8) != key.size() * 2 || key.size() >= 23 ||
+            std::memcmp(row + 9, key.c_str(), key.size() + 1) ||
+            read<uintptr_t>(row + 0x80) != entry || !read<void*>(row + 0x78) ||
+            read<FH3Mod*>(row) == mod || read<Byte>(row + 0x90)) continue;
+        return row;
+    }
+    return nullptr;
+}
+
+void* currentSettingsModel() {
+    return settingsPreviewApi ? settingsPreviewApi->model() : read<void*>(platform + 0x234e00);
+}
+
+void* currentNoticeDescriptor() {
+    return settingsPreviewApi ? settingsPreviewApi->notice() : read<void*>(platform + 0x235b10);
+}
+
+void refreshLoadPreview(Byte* row) {
+    refreshRow({read<void*>(row + 0x88), currentSettingsModel()});
+    noticeRefreshPending = true;
+}
+
+void discardLoadPreview() {
+    if (!loadPreview.row) return;
+    auto* row = loadPreview.row;
+    const int baseline = appliedLoadNotice.load() < 0 ? loadPreview.boot : appliedLoadNotice.load();
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(row + 0x68), loadPreview.accepted);
+    std::memcpy(row + 0x6c, &baseline, sizeof(baseline));
+    loadPreview = {};
+    refreshLoadPreview(row);
+}
+
+bool acceptLoadPreview() {
+    if (!loadPreview.row) return false;
+    auto* row = loadPreview.row;
+    const int requested = read<int>(row + 0x68);
+    using Changed = void (*)(void*, const char*, int);
+    const auto changed = read<Changed>(row + 0x78);
+    bool saved = false;
+    ++loadWriteEpoch; // F9 must not consume a partially written acceptance.
+    __try {
+        changed(read<void*>(row + 0x80), reinterpret_cast<const char*>(row + 9), requested);
+        saved = loaderRequestedOn(api->azimuth_dir) == (requested != 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    ++loadWriteEpoch;
+    if (!saved) { log("Could not accept the Load change. Press A to retry or B to discard."); return false; }
+    loadPreview.accepted = requested;
+    discardLoadPreview();
+    log("Accepted Load Underglow; F9 applies this saved value.");
+    return true;
+}
+
+void updateLoadNotice() {
+    const int applied = appliedLoadNotice.load();
+    auto* row = loadNoticeRow();
+    if (!row) return;
+    if (loadPreview.row && (loadPreview.page != optionsPage() || loadPreview.selected != selectedRow()))
+        discardLoadPreview();
+    int baseline = applied;
+    if (loadPreview.row == row) {
+        const int active = applied < 0 ? loadPreview.boot : applied;
+        const int shown = read<int>(row + 0x68);
+        // Show the notice for a changed preview as well as an older accepted
+        // pending request. Back removes only the preview; F9 still reads the
+        // accepted file and never the selector's temporary value.
+        const bool pending = shown != active || loadPreview.accepted != active;
+        baseline = pending ? 1 - shown : shown;
+    }
+    // Only our loader row's comparison baseline changes. Its requested value,
+    // disabled-file persistence and other mods' restart notices stay intact.
+    if (baseline >= 0 && read<int>(row + 0x6c) != baseline) {
+        std::memcpy(row + 0x6c, &baseline, sizeof(baseline));
+        noticeRefreshPending = true;
+    }
+    if (noticeRefreshPending) {
+        // The platform replaces its binding model when reopening MODS or
+        // switching views. Never retain the model from a previous row setter.
+        noticeBinding.model = currentSettingsModel();
+        noticeBinding.descriptor = currentNoticeDescriptor();
+        if (!noticeBinding.model || !noticeBinding.descriptor) return;
+        refreshRow(noticeBinding);
+        noticeRefreshPending = false;
+    }
+}
+
+void menuUpdate(void* page) {
+    originalMenuUpdate(page);
+    if (menuReady.load() && read<Byte>(platform + platformMenu->in_hub) &&
+        read<void*>(platform + platformMenu->installed_page) == page)
+        updateLoadNotice(); // Native UI thread, including while lighting is Off.
+}
+
 void menuRowSet(void* descriptor, void* model, void* value) {
+    auto* load = loadNoticeRow();
+    if (load && value && descriptor == read<void*>(load + 0x88) && optionsPage() &&
+        core::pe::readable(static_cast<Byte*>(value) + 0x28, sizeof(int))) {
+        const int requested = read<int>(static_cast<Byte*>(value) + 0x28);
+        if (requested == 0 || requested == 1) {
+            if (!loadPreview.row) loadPreview = {load, optionsPage(), selectedRow(),
+                read<int>(load + 0x68), read<int>(load + 0x6c)};
+            InterlockedExchange(reinterpret_cast<volatile LONG*>(load + 0x68), requested);
+            updateLoadNotice();
+            return; // No platform persistence callback until A is pressed.
+        }
+    }
     const auto previous = changingRow;
     changingRow = {descriptor, model};
     originalRowSet(descriptor, model, value);
@@ -470,6 +699,7 @@ void menuRowSet(void* descriptor, void* model, void* value) {
 
 void menuSelectionSet(void* descriptor, void* model, void* value) {
     originalSelectionSet(descriptor, model, value);
+    if (loadPreview.row && loadPreview.selected != selectedRow()) discardLoadPreview();
     RowBinding refresh;
     AcquireSRWLockExclusive(&settingsLock);
     if (draftRow.page && draftRow.page == optionsPage() && draftRow.selectedRow != selectedRow())
@@ -499,6 +729,12 @@ void changeOption(void* user, const char*, int value) {
 }
 
 bool menuButtons(void* page, int button, bool pressed) {
+    if (loadPreview.row) {
+        if (loadPreview.page != optionsPage() || loadPreview.selected != selectedRow() ||
+            (pressed && page == loadPreview.page && button == backButton)) discardLoadPreview();
+        else if (pressed && page == loadPreview.page && button == acceptButton) acceptLoadPreview();
+        updateLoadNotice();
+    }
     bool saveFailed = false;
     bool accepted = false;
     RowBinding refresh;
@@ -536,8 +772,8 @@ Settings settingsForFrame(bool& animateInMenu) {
     if (preview.active && !garageOptionsOpen && preview.sliders != garage::unknownSliders) {
         for (size_t i = 0; i < preview.sliders.size(); ++i) settings.sliders[i] = preview.sliders[i] / 1000.0f;
     }
-    settings.lightsEnabled = preview.active ? preview.enabled :
-        record.state == garage::State::installed && !record.lightsOff;
+    settings.lightsEnabled = modEnabled.load() && (preview.active ? preview.enabled :
+        record.state == garage::State::installed && !record.lightsOff);
     animateInMenu = page != nullptr || preview.active || garageOptionsOpen;
     const auto appearance = preview.active ? preview.appearance : garage::look(record);
     settings.options[Primary] = appearance.primary == garage::unsetPrimary ?
@@ -566,46 +802,14 @@ void addOption(size_t index) {
     setting.size = sizeof(setting);
     setting.key = row.key;
     setting.label = row.label;
-    const std::string description = std::string(row.description) + (platform ?
-        " Press A to keep the preview before leaving this row." : " Confirm in Apply Underglow Settings.");
+    const std::string description = std::string(row.description) +
+        " Press A to keep the preview before leaving this row.";
     setting.description = description.c_str();
     setting.value = savedSettings.options[index];
     setting.kind = FH3_SETTING_ON_OFF;
     setting.user = &draftSettings.options[index];
     setting.on_change = changeOption;
     api->add_setting(mod, &setting);
-}
-
-constexpr int discardPortable = 0, pendingPortable = 1, acceptPortable = 2;
-
-void applyPortableSettings(void*, const char* key, int action) {
-    if (action != acceptPortable && action != discardPortable) return;
-    const bool accept = action == acceptPortable;
-    AcquireSRWLockExclusive(&settingsLock);
-    const bool saved = !accept || saveDraft();
-    if (saved) {
-        if (accept) savedSettings = draftSettings;
-        discardDraft();
-    }
-    ReleaseSRWLockExclusive(&settingsLock);
-    api->set_setting(mod, key, pendingPortable);
-    if (!saved) log("Could not save Underglow.ini. Select Apply to retry.");
-    else if (accept) log("Saved Underglow settings through the Mod Platform API.");
-}
-
-bool addPortableSettingsAction() {
-    constexpr const char* actions[]{"Discard", "Pending", "Apply"};
-    FH3Setting setting{};
-    setting.size = sizeof(setting);
-    setting.key = "ApplySettings";
-    setting.label = "Apply Underglow Settings";
-    setting.description = "Press Right to apply the part switches, or Left to discard them.";
-    setting.value = pendingPortable;
-    setting.on_change = applyPortableSettings;
-    setting.kind = FH3_SETTING_CHOICE;
-    setting.choices = actions;
-    setting.choice_count = static_cast<uint32_t>(std::size(actions));
-    return api->add_setting(mod, &setting) != 0;
 }
 
 bool isLocalDriver(Byte* car) {
@@ -653,6 +857,7 @@ Byte* managerFor(const Byte* presentation) {
 
 void playerUpdate(void* object, float dt) {
     originalPlayer(object, dt);
+    if (stopping.load()) return;
     auto* car = static_cast<Byte*>(object);
     if (!isLocalDriver(car)) return;
     garage::updateCar(car, GetTickCount64());
@@ -819,6 +1024,7 @@ CarExtents extentsFor(const Byte* presentation) {
 
 void carLights(void* object) {
     originalCarLights(object);
+    if (stopping.load()) return;
     auto* presentation = static_cast<Byte*>(object);
     AcquireSRWLockExclusive(&snapshotLock);
     const auto now = GetTickCount64();
@@ -833,6 +1039,26 @@ void carLights(void* object) {
         }
     }
     ReleaseSRWLockExclusive(&snapshotLock);
+    const auto* provider = meetProvider.load();
+    if (provider && modEnabled.load() && isPresentation(presentation)) {
+        XMFLOAT4X4 matrix;
+        FH3MeetAppearance appearance{sizeof(FH3MeetAppearance),0,0,0,0,{0,0,0}};
+        auto* manager = managerFor(presentation);
+        if (manager && read(presentation + 0x1a0, matrix) && validMatrix(matrix)) {
+            const float point[]{matrix._41, matrix._42, matrix._43};
+            if (provider->lookup(presentation, point, &appearance) && appearance.slot > 0 && appearance.slot < meetSnapshots.size()) {
+                Snapshot pose{};
+                pose.presentation = presentation;
+                pose.manager = manager;
+                pose.matrix = matrix;
+                pose.matrixTick = now;
+                if (autoFit) pose.extents = extentsFor(presentation);
+                AcquireSRWLockExclusive(&snapshotLock);
+                meetSnapshots[appearance.slot] = {pose, appearance};
+                ReleaseSRWLockExclusive(&snapshotLock);
+            }
+        }
+    }
 }
 
 struct Pool {
@@ -861,52 +1087,86 @@ Byte* allocated(const Pool& pool, size_t stride, Id id) {
     return node;
 }
 
-bool ownsLight(const Pool& lights, size_t i) {
-    const auto* node = allocated(lights, lightStride, world.lights[i]);
-    return node && read<Id>(node + 0x38) == world.generations[i] &&
-           read<Id>(node + 0x30) == world.presets[i];
+bool ownsLight(const Pool& lights, size_t i, const World& owner = world) {
+    const auto* node = allocated(lights, lightStride, owner.lights[i]);
+    return node && read<Id>(node + 0x38) == owner.generations[i] &&
+           read<Id>(node + 0x30) == owner.presets[i];
 }
 
-void removeLights(Byte* manager, const Pool& lights, const Pool& presets, bool partial = false) {
-    if (world.lightPool != lights.begin || world.presetPool != presets.begin) return;
-    using Destroy = void (*)(void*, Id*);
-    bool ownsPoolState = partial;
-    for (size_t i = 0; i < lightCount; ++i) {
-        if (!ownsLight(lights, i)) continue;
-        native<Destroy>(destroyLight)(manager, &world.lights[i]);
-        ownsPoolState = true;
+SmallString presetName(uint64_t identity) {
+    SmallString name;
+    std::snprintf(name.text, sizeof(name.text), "UG%013llX", static_cast<unsigned long long>(identity));
+    name.length = 15;
+    return name;
+}
+
+bool ownsPreset(const Pool& presets, size_t i, const World& owner = world) {
+    const auto* node = allocated(presets, presetStride, owner.presets[i]);
+    SmallString actual;
+    const auto expected = presetName(owner.presetNames[i]);
+    if (!node || !owner.presetNames[i] || !read(node + 0x10, actual) ||
+        actual.length < expected.length || actual.length > expected.length + 20 ||
+        actual.capacity < actual.length) return false;
+    // FH3 appends its allocation counter even to an already unique name,
+    // which can move this MSVC string from inline storage onto the heap.
+    const char* text = actual.text;
+    if (actual.capacity >= 16) std::memcpy(&text, actual.text, sizeof(text));
+    std::array<char, 15> prefix{};
+    if (!text || !read(text, prefix) ||
+        std::memcmp(prefix.data(), expected.text, prefix.size())) return false;
+    for (size_t j = expected.length; j <= actual.length; ++j) {
+        char value{};
+        if (!read(text + j, value) || (j == actual.length ? value != '\0' : value < '0' || value > '9')) return false;
     }
-    if (ownsPoolState) {
-        for (auto& id : world.presets) {
-            const auto* node = allocated(presets, presetStride, id);
-            if (node && read<uint32_t>(node + 0x30) == 0) {
-                native<Destroy>(destroyPreset)(manager, &id);
-            }
+    return true;
+}
+
+void removeLights(Byte* manager, const Pool& lights, const Pool& presets, bool partial = false, World& owner = world) {
+    if (owner.lightPool != lights.begin || owner.presetPool != presets.begin) return;
+    using Destroy = void (*)(void*, Id*);
+    (void)partial;
+    for (size_t i = 0; i < lightCount; ++i) {
+        if (!ownsLight(lights, i, owner)) continue;
+        native<Destroy>(destroyLight)(manager, &owner.lights[i]);
+    }
+    for (size_t i = 0; i < lightCount; ++i) {
+        if (ownsPreset(presets, i, owner)) {
+            const auto* node = allocated(presets, presetStride, owner.presets[i]);
+            if (read<uint32_t>(node + 0x30) == 0)
+                native<Destroy>(destroyPreset)(manager, &owner.presets[i]);
         }
     }
-    world.lights.fill(invalid);
-    world.presets.fill(invalid);
+    owner.lights.fill(invalid);
+    owner.presets.fill(invalid);
+    owner.presetNames.fill(0);
 }
 
-bool makeLights(Byte* manager, const Pool& lights, const Pool& presets) {
+bool makeLights(Byte* manager, const Pool& lights, const Pool& presets, World& owner = world) {
+    if (stopping.load()) return false;
+    sceneCleanupDone = false;
     using CreatePreset = Id* (*)(void*, Id*, const SmallString*, const Preset*);
     using CreateLight = Id* (*)(void*, Id*);
     using Assign = void (*)(void*, Id, Id);
     using Intensity = void (*)(void*, Id, float, bool);
     if (!read<Byte*>(manager + 0x50)) return false;
-    const SmallString unnamed;
     Preset preset;
     preset.range = range;
     preset.power = power;
     for (size_t i = 0; i < lightCount; ++i) {
-        auto& presetId = world.presets[i];
-        native<CreatePreset>(createPreset)(manager, &presetId, &unnamed, &preset);
-        if (!allocated(presets, presetStride, presetId)) return false;
-        auto& id = world.lights[i];
+        auto& presetId = owner.presets[i];
+        // Native unnamed allocation can reuse a slot whose old name remains
+        // in the node, although that name is no longer in the manager's map.
+        // Its destructor then erases an absent map entry (the exit crash).
+        // Unique names take the native registration path and prove ownership.
+        owner.presetNames[i] = (++presetSequence) & 0xfffffffffffffull;
+        const auto name = presetName(owner.presetNames[i]);
+        native<CreatePreset>(createPreset)(manager, &presetId, &name, &preset);
+        if (!ownsPreset(presets, i, owner)) return false;
+        auto& id = owner.lights[i];
         native<CreateLight>(createLight)(manager, &id);
         const auto* node = allocated(lights, lightStride, id);
         if (!node) return false;
-        world.generations[i] = read<Id>(node + 0x38);
+        owner.generations[i] = read<Id>(node + 0x38);
         native<Assign>(assignPreset)(manager, id, presetId);
         native<Intensity>(setIntensity)(manager, id, 0, false);
     }
@@ -973,10 +1233,17 @@ XMFLOAT4 localPosition(const Footprint& footprint, size_t zone, size_t segment) 
     return points[zone];
 }
 
+namespace npcRadio {
+void nativeTick(ULONGLONG now);
+void cleanupNative();
+fx::AudioFrame frame(uint64_t identity, ULONGLONG now);
+void start();
+}
+
 #include "Radio.h"
 
 void renderLights(Byte* manager, const Pool& presets, const Snapshot& frame, const Settings& settings,
-                  ULONGLONG animationTick) {
+                  ULONGLONG animationTick, const World& owner = world, const fx::AudioFrame* carAudio = nullptr) {
     using Transform = void (*)(void*, Id, const XMFLOAT4*);
     using Intensity = void (*)(void*, Id, float, bool);
     const auto matrix = XMLoadFloat4x4(&frame.matrix);
@@ -988,7 +1255,7 @@ void renderLights(Byte* manager, const Pool& presets, const Snapshot& frame, con
     XMStoreFloat4(&rotation, XMQuaternionMultiply(down, carRotation));
     const Color first = garage::resolvedColor(settings.options[Primary], settings.garageRgb);
     const Color second = garage::effectSecondary(first, garage::resolvedColor(settings.options[Secondary], settings.garageRgb));
-    const auto audio = radio::frame(GetTickCount64());
+    const auto audio = carAudio ? *carAudio : radio::frame(GetTickCount64());
     const bool radioPlaying = std::any_of(std::begin(audio.lvl), std::end(audio.lvl), [](float level) { return level > 0; });
     const float brightness = settings.sliders[Brightness];
     const fx::EffectFrame effects{settings.sliders[Speed], {first.r, first.g, first.b}, {second.r, second.g, second.b}, audio};
@@ -1002,7 +1269,7 @@ void renderLights(Byte* manager, const Pool& presets, const Snapshot& frame, con
         const bool lit = settings.options[Front + zone] && (radioPlaying || !isAudioEffect(mode));
         for (size_t segment = 0; segment < zoneSizes[zone]; ++segment) {
             const size_t index = zoneStarts[zone] + segment;
-            const Id light = world.lights[index];
+            const Id light = owner.lights[index];
             const auto local = localPosition(footprint, zone, segment);
             XMFLOAT4 position;
             XMStoreFloat4(&position, XMVector3TransformCoord(XMLoadFloat4(&local), matrix));
@@ -1016,8 +1283,8 @@ void renderLights(Byte* manager, const Pool& presets, const Snapshot& frame, con
                 float rgb[3];
                 fx::effect_now(effects, mode, p, seconds, rgb, &level);
                 if (level > 0.01f) {
-                    auto* preset = allocated(presets, presetStride, world.presets[index]);
-                    if (preset && std::memcmp(preset + 0x50, rgb, sizeof(rgb))) {
+                    auto* preset = allocated(presets, presetStride, owner.presets[index]);
+                    if (preset && ownsPreset(presets, index, owner) && std::memcmp(preset + 0x50, rgb, sizeof(rgb))) {
                         std::memcpy(preset + 0x50, rgb, sizeof(rgb));
                         dirty = true;
                     }
@@ -1040,7 +1307,100 @@ Byte* activeDaylightManager() {
     return manager && GetTickCount64() <= daylightUntil.load() ? manager : nullptr;
 }
 
-void updateSceneLights(Byte* manager, const Settings& settings, bool animateInMenu) {
+bool currentMeetPose(const MeetSnapshot& frame) {
+    const auto* provider = meetProvider.load();
+    if (!provider || !frame.pose.matrixTick) return false;
+    FH3MeetAppearance current{sizeof(FH3MeetAppearance),0,0,0,0,{0,0,0}};
+    const float point[]{frame.pose.matrix._41, frame.pose.matrix._42, frame.pose.matrix._43};
+    return provider->lookup(frame.pose.presentation, point, &current) &&
+        current.meet == frame.appearance.meet && current.slot == frame.appearance.slot &&
+        current.identity == frame.appearance.identity && managerFor(frame.pose.presentation) == frame.pose.manager;
+}
+
+Settings meetSettings(const FH3MeetAppearance& appearance) {
+    Settings settings{};
+    settings.lightsEnabled = modEnabled.load();
+    for (size_t zone = 0; zone < zoneCount; ++zone) settings.options[Front + zone] = 1;
+    const auto& rgb = appearance.rgb;
+    settings.garageRgb = (static_cast<unsigned>(std::clamp(rgb[0], 0.0f, 1.0f) * 255) << 16) |
+        (static_cast<unsigned>(std::clamp(rgb[1], 0.0f, 1.0f) * 255) << 8) |
+        static_cast<unsigned>(std::clamp(rgb[2], 0.0f, 1.0f) * 255);
+    const uint32_t seed = static_cast<uint32_t>(appearance.identity ^ (appearance.identity >> 32)) ^
+        (appearance.meet * 0x9e3779b9u);
+    const unsigned random = static_cast<unsigned>(fx::hash01(seed + appearance.slot * 0x85ebca6bu) * 16777216);
+    // Distribute the four effect families across the row so audio, one-color,
+    // two-color and multicolor cars can coexist. Each identity gets a stable
+    // selection from the complete catalog, not a reroll on camera changes.
+    const int group = static_cast<int>((appearance.slot + appearance.meet) % fx::kGroupCount);
+    std::array<int, fx::kEffectCount> choices{};
+    size_t count = 0;
+    for (const auto entry : fx::kEffectOrder) if (entry.group == group) choices[count++] = entry.effect;
+    settings.effects.fill(choices[random % count]);
+    settings.options[Primary] = garage::tunedColor;
+    settings.options[Secondary] = static_cast<int>((random >> 8) % fx::kColorCount);
+    settings.sliders[Brightness] = .6f + ((random >> 4) % 41) / 100.0f;
+    settings.sliders[Speed] = .35f + ((random >> 12) % 166) / 100.0f;
+    return settings;
+}
+
+#include "Drivatars.h"
+#include "NpcRadio.h"
+
+bool updateMeetLights(Byte* manager) {
+    std::array<MeetSnapshot, FH3_CAR_MEETS_SLOTS> frames;
+    AcquireSRWLockShared(&snapshotLock);
+    frames = meetSnapshots;
+    ReleaseSRWLockShared(&snapshotLock);
+    // Random meet colors are transient. Never change Garage records or the
+    // player's equipped appearance, and never replace a shadow resource.
+    const auto lights = readPool(manager, 0, lightStride);
+    const auto presets = readPool(manager, 0x38, presetStride);
+    bool lit = false;
+    bool audioActive = false;
+    for (size_t slot = 0; slot < frames.size(); ++slot) {
+        const auto& frame = frames[slot];
+        const auto settings = meetSettings(frame.appearance);
+        auto& owner = meetWorlds[slot];
+        const bool active = slot != 0 && settings.lightsEnabled && frame.pose.manager == manager && currentMeetPose(frame);
+        if (!active && owner.manager != manager) continue;
+        if (owner.manager != manager || owner.lightPool != lights.begin || owner.presetPool != presets.begin) {
+            owner = World{};
+            owner.manager = manager;
+            owner.lightPool = lights.begin;
+            owner.presetPool = presets.begin;
+            meetIdentities[slot] = 0;
+        }
+        if (!active || meetIdentities[slot] != frame.appearance.identity) {
+            removeLights(manager, lights, presets, false, owner);
+        }
+        if (!active) continue;
+        audioActive = true;
+        if (owner.lights.front() != invalid) {
+            bool valid = true;
+            for (size_t i = 0; i < lightCount; ++i) valid &= ownsLight(lights, i, owner) && ownsPreset(presets, i, owner);
+            if (!valid) removeLights(manager, lights, presets, false, owner);
+        }
+        const auto now = GetTickCount64();
+        if (lights.begin && presets.begin && owner.lights.front() == invalid && now >= owner.retryAfter) {
+            if (!makeLights(manager, lights, presets, owner)) {
+                removeLights(manager, lights, presets, true, owner);
+                owner.retryAfter = now + 2000;
+                if (!owner.reportedCapacity) log("Waiting for free Car Meet light slots.");
+                owner.reportedCapacity = true;
+                continue;
+            }
+            meetIdentities[slot] = frame.appearance.identity;
+        }
+        if (owner.lights.front() == invalid) continue;
+        renderLights(manager, presets, frame.pose, settings, now, owner);
+        const auto first = settings.options.begin() + Front;
+        lit |= settings.sliders[Brightness] > 0 && std::any_of(first, first + zoneCount, [](int on) { return on != 0; });
+    }
+    if (audioActive) meetAudioUntil = GetTickCount64() + 500;
+    return lit;
+}
+
+bool updateSceneLights(Byte* manager, const Settings& settings, bool animateInMenu) {
     Snapshot frame;
     AcquireSRWLockShared(&snapshotLock);
     frame = snapshot;
@@ -1052,6 +1412,7 @@ void updateSceneLights(Byte* manager, const Settings& settings, bool animateInMe
     const bool hasOwner = hasPose && isLocalDriver(frame.car) &&
         presentationFor(frame.car) == frame.presentation && managerFor(frame.presentation) == manager;
     const bool active = hasOwner && settings.lightsEnabled;
+    bool keepDaylight = false;
     if (active || world.manager == manager) {
         const auto lights = readPool(manager, 0, lightStride);
         const auto presets = readPool(manager, 0x38, presetStride);
@@ -1063,7 +1424,7 @@ void updateSceneLights(Byte* manager, const Settings& settings, bool animateInMe
         }
         if (world.lights.front() != invalid) {
             bool valid = true;
-            for (size_t i = 0; i < lightCount; ++i) valid &= ownsLight(lights, i);
+            for (size_t i = 0; i < lightCount; ++i) valid &= ownsLight(lights, i) && ownsPreset(presets, i);
             if (!hasOwner || !valid) removeLights(manager, lights, presets);
         }
         if (active && lights.begin && presets.begin && now >= world.retryAfter && world.lights.front() == invalid) {
@@ -1088,18 +1449,46 @@ void updateSceneLights(Byte* manager, const Settings& settings, bool animateInMe
         }
         const auto firstPart = std::begin(settings.options) + Front;
         const bool hasLitParts = std::any_of(firstPart, firstPart + zoneCount, [](int on) { return on != 0; });
-        const bool keepDaylight = daylightReady.load() && active && hasLitParts && settings.sliders[Brightness] > 0 &&
+        keepDaylight = active && hasLitParts && settings.sliders[Brightness] > 0 &&
             world.lights.front() != invalid;
-        if (keepDaylight) daylightUntil = now + 500;
-        daylightManager = keepDaylight ? manager : nullptr;
     }
+    return keepDaylight;
 }
 
 void sceneLights(void* object) {
+    if (stopping.load()) {
+        AcquireSRWLockExclusive(&worldLock);
+        auto* manager = static_cast<Byte*>(object);
+        const auto lights = readPool(manager, 0, lightStride);
+        const auto presets = readPool(manager, 0x38, presetStride);
+        const auto retire = [&](World& owner) {
+            if (owner.manager == manager) removeLights(manager, lights, presets, false, owner);
+            // A different scene owns any retired pool; never destroy through its stale manager.
+            owner = World{};
+        };
+        retire(world);
+        for (auto& owner : meetWorlds) retire(owner);
+        for (auto& owner : drivatarWorlds) retire(owner);
+        daylightManager = nullptr;
+        daylightUntil = 0;
+        sceneCleanupDone = true;
+        originalSceneLights(object);
+        ReleaseSRWLockExclusive(&worldLock);
+        return;
+    }
     bool animateInMenu;
     const auto settings = settingsForFrame(animateInMenu);
     AcquireSRWLockExclusive(&worldLock);
-    updateSceneLights(static_cast<Byte*>(object), settings, animateInMenu);
+    const bool playerLit = updateSceneLights(static_cast<Byte*>(object), settings, animateInMenu);
+    const bool meetLit = updateMeetLights(static_cast<Byte*>(object));
+    const bool drivatarLit = updateDrivatarLights(static_cast<Byte*>(object));
+    if ((playerLit || meetLit || drivatarLit) && daylightReady.load()) {
+        daylightUntil = GetTickCount64() + 500;
+        daylightManager = static_cast<Byte*>(object);
+    } else if (daylightManager.load() == object) {
+        daylightManager = nullptr;
+        daylightUntil = 0;
+    }
     originalSceneLights(object);
     ReleaseSRWLockExclusive(&worldLock);
 }
@@ -1140,7 +1529,8 @@ constexpr float daylightIntensityScale = 16.0f;
 
 struct DaylightUpload {
     Pool presets;
-    std::array<Id, lightCount> slots{};
+    std::array<Id, maxOwnedLights> slots{};
+    size_t slotCount{};
     bool prepared{};
     Byte* firstPacket{};
     Id packetCount{};
@@ -1152,20 +1542,27 @@ void* copyLightPacket(void* destination, const void* source, size_t size) {
     if (!upload || size != lightPacketSize) return originalCopyLightPacket(destination, source, size);
     if (!upload->prepared) {
         // The native upload assigns the GPU preset slots before packing the lights.
-        for (size_t i = 0; i < lightCount; ++i) {
-            const auto* preset = allocated(upload->presets, presetStride, world.presets[i]);
-            upload->slots[i] = preset ? read<Id>(preset + 0x34) : invalid;
-        }
-        std::sort(upload->slots.begin(), upload->slots.end());
+        const auto collect = [&](const World& owner) {
+            if (owner.manager != activeDaylightManager() || owner.presetPool != upload->presets.begin) return;
+            for (const Id id : owner.presets) {
+                const auto* preset = allocated(upload->presets, presetStride, id);
+                const Id slot = preset ? read<Id>(preset + 0x34) : invalid;
+                if (slot != invalid && upload->slotCount < upload->slots.size()) upload->slots[upload->slotCount++] = slot;
+            }
+        };
+        collect(world);
+        for (const auto& owner : meetWorlds) collect(owner);
+        for (const auto& owner : drivatarWorlds) collect(owner);
+        std::sort(upload->slots.begin(), upload->slots.begin() + upload->slotCount);
         upload->prepared = true;
     }
-    // Compact the player neon into the front of the mapped GPU input buffer.
+    // Compact all owned neon into the front of the mapped GPU input buffer.
     // The other world lights stay suppressed during the game's daytime pass.
     if (!upload->firstPacket) upload->firstPacket = static_cast<Byte*>(destination);
     const auto* bytes = static_cast<const Byte*>(source);
     const Id slot = read<Id>(bytes + 0x20);
-    if (slot != invalid && upload->packetCount < lightCount &&
-        std::binary_search(upload->slots.begin(), upload->slots.end(), slot)) {
+    if (slot != invalid && upload->packetCount < upload->slotCount &&
+        std::binary_search(upload->slots.begin(), upload->slots.begin() + upload->slotCount, slot)) {
         std::array<Byte, lightPacketSize> packet;
         std::memcpy(packet.data(), source, size);
         // Apply exposure compensation to the same brightness and effect level used at night.
@@ -1185,8 +1582,7 @@ void uploadLights(void* object, void* renderer, unsigned char night) {
     auto* manager = static_cast<Byte*>(object);
     AcquireSRWLockExclusive(&worldLock);
     const auto presets = readPool(manager, 0x38, presetStride);
-    const bool active = world.manager == manager && world.lights.front() != invalid &&
-        world.presetPool == presets.begin && manager == activeDaylightManager();
+    const bool active = manager == activeDaylightManager();
     DaylightUpload upload{presets};
     auto* previous = daylightUpload;
     if (active) daylightUpload = &upload;
@@ -1248,6 +1644,16 @@ const Byte* menuPlatform() {
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
             static_cast<LPCWSTR>(anchor), &module)) continue;
         const auto* base = reinterpret_cast<const Byte*>(module);
+        using PreviewApi = const core::platform_menu::SettingsPreviewV1* (*)();
+        if (auto fn = reinterpret_cast<PreviewApi>(GetProcAddress(module, "FH3ModPlatformSettingsPreviewV1"))) {
+            const auto* preview = fn();
+            if (preview && preview->size >= sizeof(*preview) && preview->version == 2 &&
+                preview->page && preview->selected && preview->buttons && preview->row_set &&
+                preview->selection_set && preview->notify && preview->load_row && preview->model && preview->notice) {
+                settingsPreviewApi = preview;
+                return base;
+            }
+        }
         if ((platformMenu = core::platform_menu::find_platform_menu(base))) return base;
     }
     return nullptr;
@@ -1257,18 +1663,53 @@ bool supported() {
     if (!matchesImage(game, timestamp, imageSize)) return false;
     for (const auto& check : checks) {
         Byte actual[16]{};
-        if (!read(game + check.offset, actual) || std::memcmp(actual, check.bytes, check.count)) return false;
+        if (!read(game + check.offset, actual)) return false;
+        if (!std::memcmp(actual, check.bytes, check.count)) continue;
+        // Car Meets and other platform mods may already own a link at these
+        // shared CALL sites. Recognize only the platform relay shape here;
+        // hook_call remains responsible for admitting a registered chain and
+        // rejecting bytes changed outside the platform. Other build checks
+        // remain exact, including all accessors and lighting functions.
+        const bool sharedCall = check.offset == playerTickCall || check.offset == carLightsCall || check.offset == sceneLightsCall;
+        if (!sharedCall || check.count != 5 || actual[0] != 0xe8) return false;
+        int32_t displacement{};std::memcpy(&displacement, actual + 1, sizeof displacement);
+        const auto target = reinterpret_cast<uintptr_t>(game + check.offset + 5) + displacement;
+        std::array<Byte, 8> relay{};
+        // The platform's call relay uses a separate writable target slot one
+        // page after its executable stub (RIP+0xFFA), followed by INT3 padding.
+        if (!read(reinterpret_cast<const Byte*>(target), relay) || relay != std::array<Byte,8>{0xff,0x25,0xfa,0x0f,0,0,0xcc,0xcc}) return false;
     }
     return true;
 }
 
 bool installMenuHook() {
+    if (settingsPreviewApi) {
+        notifyProperty = settingsPreviewApi->notify;
+        const std::array<FH3Hook*, 3> hooks{
+            api->hook_function(mod, "Underglow settings Accept and Back", settingsPreviewApi->buttons,
+                reinterpret_cast<void*>(menuButtons), reinterpret_cast<void**>(&originalMenuButtons)),
+            api->hook_function(mod, "Underglow slider binding", settingsPreviewApi->row_set,
+                reinterpret_cast<void*>(menuRowSet), reinterpret_cast<void**>(&originalRowSet)),
+            api->hook_function(mod, "Underglow settings row selection", settingsPreviewApi->selection_set,
+                reinterpret_cast<void*>(menuSelectionSet), reinterpret_cast<void**>(&originalSelectionSet)),
+        };
+        for (size_t i = 0; i < hooks.size(); ++i) {
+            if (!hooks[i] || !api->enable_hooks(mod, hooks[i])) {
+                while (i) api->disable_hooks(mod, hooks[--i]);
+                return false;
+            }
+        }
+        menuReady = true;
+        return true;
+    }
     // Attach to the loader's handler. It can wire the HUD slot after a slow database rebuild.
     struct SelectionLayout {
         DWORD stamp;
         size_t setter, store, selected;
     };
     constexpr SelectionLayout layouts[] = {
+        {0x6af85a9e, 0xdd320, 0x69, 0x2362a8},
+        {0x6af5f686, 0xdb990, 0x69, 0x235268},
         {0x6aee7575, 0xca690, 0x69, 0x21f138},
         {0x47a22c2d, 0xbe0e0, 0x67, 0x2155f8},
         {0x6ae83e9d, 0xa0220, 0x69, 0x1e5d10},
@@ -1303,6 +1744,13 @@ bool installMenuHook() {
             while (i) api->disable_hooks(mod, hooks[--i]);
             return false;
         }
+    }
+    if (platformMenu->stamp == 0x6af85a9e) {
+        auto** slot = reinterpret_cast<void**>(game + 0x4566590 + 0x580);
+        if (read<const Byte*>(reinterpret_cast<const Byte*>(slot)) != game + 0x14a43d0) return false;
+        auto* hook = api->hook_pointer ? api->hook_pointer(mod, "Underglow pending Load notice",
+            slot, reinterpret_cast<void*>(menuUpdate), reinterpret_cast<void**>(&originalMenuUpdate)) : nullptr;
+        if (!hook || !api->enable_hooks(mod, hook)) return false;
     }
     menuReady.store(true);
     return true;
@@ -1343,8 +1791,8 @@ bool installDaylightHooks() {
         game + clusterLightCheck, buildDaylightClusters, nullptr);
     if (!hooks[std::size(sites)]) return false;
     for (size_t i = 0; i < std::size(hooks); ++i) {
-        if (!api->enable_hooks(mod, hooks[i])) {
-            while (i > 0) api->disable_hooks(mod, hooks[--i]);
+        if (!enableOwnHook(hooks[i])) {
+            while (i > 0) disableOwnHook(hooks[--i]);
             return false;
         }
     }
@@ -1379,11 +1827,12 @@ void installWreckingBallGuard() {
     if (!core::platform_menu::matches(game + call, "\xe8\x38\xf3\xff\xff", 5)) return;
     auto* hook = api->hook_call(mod, "WreckingBall track draw binding guard", game + call,
         reinterpret_cast<void*>(recordTrackDraw), reinterpret_cast<void**>(&originalTrackDraw));
-    if (hook && api->enable_hooks(mod, hook))
+    if (hook && enableOwnHook(hook))
         log("WreckingBall track draw compatibility guard is ready.");
 }
 
 void waitForExtendedSettings() {
+    if (settingsPreviewApi) return; // Explicit host callbacks support its hook chain.
     if (!api->mod_version || !api->mod_version("Horizon 3 Extended")) return;
     const auto config = std::wstring(api->azimuth_dir) + L"\\Horizon3Extended\\Horizon3Extended.ini";
     if (!GetPrivateProfileIntW(L"Global", L"Enabled", 1, config.c_str())) return;
@@ -1392,29 +1841,51 @@ void waitForExtendedSettings() {
     const auto* setter = platform + platformMenu->row_set;
     for (unsigned attempt = 0; attempt < 400 &&
          core::platform_menu::matches(setter, platformMenu->row_set_prologue, 12); ++attempt) {
-        Sleep(25);
+        if (stopWait(25)) return;
     }
 }
 
 DWORD WINAPI installHooks(void*) {
-    if (api->wait_for_mods) api->wait_for_mods(INFINITE);
-    game = static_cast<Byte*>(api->wait_for_code(INFINITE));
+    if (api->wait_for_mods) {
+        while (!api->wait_for_mods(50)) if (stopping.load()) return 0;
+    }
+    if (stopping.load()) return 0;
+    if (api->get_interface) {
+        const auto* provider = static_cast<const FH3CarMeetsV1*>(
+            api->get_interface(FH3_CAR_MEETS_INTERFACE, FH3_CAR_MEETS_INTERFACE_VERSION));
+        if (provider && provider->size >= sizeof(FH3CarMeetsV1) && provider->lookup) {
+            meetProvider = provider;
+            log("Car Meets parked-car lighting interface connected.");
+        }
+    }
+    while (!stopping.load() && !game) {
+        game = static_cast<Byte*>(api->wait_for_code(50));
+        // A different selected game makes wait_for_code return NULL immediately.
+        // Keep retries cancellable without spinning a CPU core in FH2.
+        if (!game && stopWait(50)) return 0;
+    }
+    if (stopping.load()) return 0;
     if (!supported()) {
         log("Underglow stayed off. The mapped FH3 build or a required call site differs.");
         return 0;
     }
-    if (!api->hook_call(mod, "Local player presentation", game + playerTickCall,
-                        reinterpret_cast<void*>(playerUpdate), reinterpret_cast<void**>(&originalPlayer)) ||
-        !api->hook_call(mod, "Car light transform", game + carLightsCall,
-                        reinterpret_cast<void*>(carLights), reinterpret_cast<void**>(&originalCarLights)) ||
-        !api->hook_call(mod, "ForwardPlus scene lights", game + sceneLightsCall,
-                        reinterpret_cast<void*>(sceneLights), reinterpret_cast<void**>(&originalSceneLights)) ||
-        !api->enable_hooks(mod, nullptr)) {
-        api->disable_hooks(mod, nullptr);
+    setupTouched = true;
+    const std::array<FH3Hook*, 3> coreHooks{
+        api->hook_call(mod, "Local player presentation", game + playerTickCall,
+                        reinterpret_cast<void*>(playerUpdate), reinterpret_cast<void**>(&originalPlayer)),
+        api->hook_call(mod, "Car light transform", game + carLightsCall,
+                        reinterpret_cast<void*>(carLights), reinterpret_cast<void**>(&originalCarLights)),
+        api->hook_call(mod, "ForwardPlus scene lights", game + sceneLightsCall,
+                        reinterpret_cast<void*>(sceneLights), reinterpret_cast<void**>(&originalSceneLights))};
+    if (!std::all_of(coreHooks.begin(), coreHooks.end(), [](FH3Hook* hook) { return enableOwnHook(hook) != 0; })) {
+        switchOwnHooks(false);
         log("Underglow stayed off. A required hook could not be enabled.");
         return 0;
     }
     log("FH3 lighting hooks enabled. Waiting for the local player car.");
+    log(installDrivatarHook() ? "Random local and race Drivatar underglow enabled." :
+        "Drivatar underglow is unavailable on this game build.");
+    npcRadio::start();
     if (supportHorizon3Extended) installWreckingBallGuard();
     log(installDaylightHooks() ? "Daylight underglow enabled for the local car." :
         "Daylight underglow is unavailable on this game build.");
@@ -1429,8 +1900,50 @@ DWORD WINAPI installHooks(void*) {
         if (installMenuHook()) log("Settings preview is ready. Press Accept to save changes.");
         else log("Could not enable settings confirmation. Underglow will use its saved settings.");
     }
+    setupComplete = true;
+    log("Underglow startup complete.");
     return 0;
 }
+
+bool canShutdown() {
+    AcquireSRWLockShared(&settingsLock);
+    const bool options = garage::optionsPreviewActive;
+    ReleaseSRWLockShared(&settingsLock);
+    return !garage::runtimePageOpen.load() && !options;
+}
+
+void shutdown() {
+    if (!canShutdown()) {
+        log("Close the Underglow garage editor before pressing F9; nothing was shut down.");
+        RaiseException(0xe0554702, 0, 0, nullptr);
+        return;
+    }
+    AcquireSRWLockExclusive(&shutdownLock);
+    stopping = true;
+    modEnabled = false;
+    if (stopEvent) SetEvent(stopEvent);
+    if (setupThread) {
+        WaitForSingleObject(setupThread, INFINITE);
+        CloseHandle(setupThread);
+        setupThread = nullptr;
+    }
+    npcRadio::stop();
+    // Native resources belong to the game's render/audio threads. Their existing
+    // hooks retire them there before the platform removes any detours.
+    const ULONGLONG until = GetTickCount64() + 5500;
+    while ((!sceneCleanupDone.load() || !audioCleanupDone.load()) && GetTickCount64() < until) Sleep(10);
+    const bool complete = sceneCleanupDone.load() && audioCleanupDone.load();
+    if (complete && stopEvent) { CloseHandle(stopEvent); stopEvent = nullptr; }
+    ReleaseSRWLockExclusive(&shutdownLock);
+    if (!complete) {
+        log("Shutdown is waiting for a game render/audio frame. Return to the game and press F9 again.");
+        RaiseException(0xe0554701, 0, 0, nullptr);
+        return;
+    }
+    log("Shutdown complete: workers stopped and owned lights/radios released.");
+}
+
+#include "RuntimeToggle.h"
 } // namespace
 
 FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* host) {
@@ -1438,16 +1951,24 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* host) {
         !host->register_mod || !host->log || !host->azimuth_dir || !host->wait_for_code ||
         !host->hook_call || !host->enable_hooks || !host->disable_hooks || !host->add_setting ||
         !host->set_setting) return 0;
-    if (host->mod_version && host->mod_version(modName)) return 0;
-    const FH3ModInfo info{sizeof(FH3ModInfo), modName, modVersion, nullptr, "1.0.0", 0, modDescription, 1};
+    const bool reload = host->api_version >= 16 &&
+        host->size >= offsetof(FH3ModApi, is_reloading) + sizeof(host->is_reloading) &&
+        host->is_reloading && host->is_reloading();
+    if (!reload && host->mod_version && host->mod_version(modName)) return 0;
+    const FH3ModInfo info{sizeof(FH3ModInfo), modName, modVersion, "Laur1sXd/UnderglowFH3", "1.0.0", 1, modDescription, 1};
     mod = host->register_mod(&info);
     if (!mod) return 0;
     api = host;
+    stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!stopEvent) { log("Could not create the shutdown event."); return 1; }
     animationStart = GetTickCount64();
     if (!initializeIni(host->azimuth_dir)) {
         log("Underglow stayed off. It could not prepare Underglow.ini.");
         return 0;
     }
+    // Garage installation/No Underglow controls personal lighting. Ignore a
+    // legacy master switch so an old Enabled=0 cannot hide a newly applied setup.
+    modEnabled = true;
     for (size_t i = 0; i < std::size(optionRows); ++i) {
         const auto& row = optionRows[i];
         savedSettings.options[i] = getInt(row.iniKey, row.initial, 0, row.max);
@@ -1496,17 +2017,54 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* host) {
     if (legacyGeometry && range == 3.3f) range = defaultRange;
 
     platform = menuPlatform();
-    if (platform || addPortableSettingsAction()) {
-        for (size_t i = Front; i < std::size(optionRows); ++i) addOption(i);
-        if (!platform) log("Using the Mod Platform API for Underglow settings. Use Apply Underglow Settings to confirm.");
+    if (platform) {
+        for (const auto part : {Front, Rear, Left, Right}) addOption(part);
     } else {
         log("This Mod Platform build does not support Underglow's options menu. Using Underglow.ini.");
     }
 
-    if (HANDLE thread = CreateThread(nullptr, 0, installHooks, nullptr, 0, nullptr)) {
-        CloseHandle(thread);
-    } else {
+    if (!loaderRequestedOn(host->azimuth_dir)) {
+        // The compatibility loader initializes metadata/settings once even when
+        // disabled at boot. No workers or game hooks are started in this state.
+        modEnabled = false;
+        stopping = true;
+        CloseHandle(stopEvent);
+        stopEvent = nullptr;
+        log("Load is OFF: metadata only; press F9 after choosing ON to activate.");
+        startRuntimeMonitor(false);
+        return 0;
+    }
+    setupThread = CreateThread(nullptr, 0, installHooks, nullptr, 0, nullptr);
+    if (!setupThread) {
         log("Underglow stayed off. The setup thread could not be created.");
     }
+    startRuntimeMonitor(true);
     return 0;
 }
+
+FH3MOD_EXPORT void fh3mod_shutdown() {
+    if (!canShutdown()) { shutdown(); return; }
+    stopRuntimeMonitor();
+    shutdown();
+}
+// Opt in to the separate platform build's Load-setting/F9 workflow.
+FH3MOD_EXPORT int fh3mod_runtime_toggle() { return 1; }
+FH3MOD_EXPORT int fh3mod_can_shutdown() {
+    return canShutdown() ? 1 : 0;
+}
+FH3MOD_EXPORT int fh3mod_apply_runtime_load() { return applyRuntimeLoad() ? 1 : 0; }
+FH3MOD_EXPORT int fh3mod_runtime_load_state() { return runtimeActive.load() ? 1 : 0; }
+
+#ifdef FH3_F9_COMPAT_TEST
+
+extern "C" __declspec(dllexport) int F9CompatReady(){return setupComplete.load() && menuReady.load() && builtinRuntime;}
+extern "C" __declspec(dllexport) int F9CompatAccept(int value){
+ auto* row=loadNoticeRow();if(!row)return 0;
+ loadPreview={row,optionsPage(),selectedRow(),read<int>(row+0x68),read<int>(row+0x6c)};
+ std::memcpy(row+0x68,&value,4);return acceptLoadPreview();
+}
+extern "C" __declspec(dllexport) int F9CompatApplied(){return runtimeActive.load();}
+extern "C" __declspec(dllexport) int F9CompatPending(){auto*r=loadNoticeRow();return !r?-1:read<int>(r+0x68)!=read<int>(r+0x6c);}
+extern "C" __declspec(dllexport) void F9CompatPump(){updateLoadNotice();}
+
+#endif
