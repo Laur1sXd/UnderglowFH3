@@ -535,8 +535,8 @@ bool install() {
     for (size_t i = 0; i < count; ++i) {
         const auto& hook = hooks[i];
         installed[i] = api->hook_function(mod, "FH3 ANNA Underglow audio", game + hook.rva, hook.callback, hook.original);
-        if (!installed[i] || !api->enable_hooks(mod, installed[i])) {
-            while (i) api->disable_hooks(mod, installed[--i]);
+        if (!installed[i] || !enableOwnHook(installed[i])) {
+            while (i) disableOwnHook(installed[--i]);
             return false;
         }
     }
