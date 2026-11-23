@@ -35,7 +35,7 @@ using Byte = unsigned char;
 using Id = uint32_t;
 constexpr Id invalid = UINT32_MAX;
 constexpr char modName[] = "Underglow";
-constexpr char modVersion[] = "1.0.2";
+constexpr char modVersion[] = "1.0.3";
 constexpr char modDescription[] = "Customize per-car Underglow in Designs and Paints.";
 
 // Xbox One Opus 1.0.125.0, as mapped by Azimuth.
@@ -1261,8 +1261,24 @@ void start();
 
 #include "Radio.h"
 
+// The effects' clock, in milliseconds on the wall clock's scale (effectSeconds counts from animationStart). Like FH2
+// Underglow's it stands still when the game does (the pause menu, photo mode) instead of running on the wall clock:
+// the game's own pause flag says when. A Car Meet keeps that flag up for its lobby while its cars carry on, so the
+// flag doesn't count there. Once a frame, from sceneLights; the lights of every car use it.
+ULONGLONG gameTick{};
+std::atomic<bool> gameFrozen{};
+void advanceGameClock(ULONGLONG now) {
+    static ULONGLONG last{};
+    const bool frozen = radio::pauseMenuActive() && !liveMeetAudio(now);
+    gameFrozen = frozen;
+    if (!gameTick) gameTick = animationStart ? animationStart : now;
+    if (last && !frozen) gameTick += std::min<ULONGLONG>(now > last ? now - last : 0, 250);
+    last = now;
+}
+
 void renderLights(Byte* manager, const Pool& presets, const Snapshot& frame, const Settings& settings,
-                  ULONGLONG animationTick, const World& owner = world, const fx::AudioFrame* carAudio = nullptr) {
+                  ULONGLONG animationTick, const World& owner = world, const fx::AudioFrame* carAudio = nullptr,
+                  bool previewing = false) {
     using Transform = void (*)(void*, Id, const XMFLOAT4*);
     using Intensity = void (*)(void*, Id, float, bool);
     const auto matrix = XMLoadFloat4x4(&frame.matrix);
@@ -1274,8 +1290,14 @@ void renderLights(Byte* manager, const Pool& presets, const Snapshot& frame, con
     XMStoreFloat4(&rotation, XMQuaternionMultiply(down, carRotation));
     const Color first = garage::resolvedColor(settings.options[Primary], settings.garageRgb);
     const Color second = garage::effectSecondary(first, garage::resolvedColor(settings.options[Secondary], settings.garageRgb));
-    const auto audio = carAudio ? *carAudio : radio::frame(GetTickCount64());
-    const bool radioPlaying = std::any_of(std::begin(audio.lvl), std::end(audio.lvl), [](float level) { return level > 0; });
+    const auto audioNow = GetTickCount64();
+    auto audio = carAudio ? *carAudio : radio::frame(audioNow);
+    bool radioPlaying = std::any_of(std::begin(audio.lvl), std::end(audio.lvl), [](float level) { return level > 0; });
+    // Your own car, with the radio silent (the Garage mutes it): show the audio effects on a made-up beat. Real audio wins.
+    if (!carAudio && !radioPlaying && (previewing || audioNow < radio::demoUntil.load())) {
+        audio = radio::demoFrame(animationTick); // on the effects' clock, so it holds with them
+        radioPlaying = true;
+    }
     const float brightness = settings.sliders[Brightness];
     const fx::EffectFrame effects{settings.sliders[Speed], {first.r, first.g, first.b}, {second.r, second.g, second.b}, audio};
     const double seconds = effectSeconds(animationTick);
@@ -1411,7 +1433,7 @@ bool updateMeetLights(Byte* manager) {
             meetIdentities[slot] = frame.appearance.identity;
         }
         if (owner.lights.front() == invalid) continue;
-        renderLights(manager, presets, frame.pose, settings, now, owner);
+        renderLights(manager, presets, frame.pose, settings, gameTick, owner);
         const auto first = settings.options.begin() + Front;
         lit |= settings.sliders[Brightness] > 0 && std::any_of(first, first + zoneCount, [](int on) { return on != 0; });
     }
@@ -1459,7 +1481,8 @@ bool updateSceneLights(Byte* manager, const Settings& settings, bool animateInMe
         }
         if (world.lights.front() != invalid) {
             if (active) {
-                renderLights(manager, presets, frame, settings, animateInMenu ? now : frame.matrixTick);
+                renderLights(manager, presets, frame, settings, animateInMenu ? now : gameTick, world, nullptr,
+                             animateInMenu);
             } else {
                 // Keep the current car's lights ready to resume without recycling its GPU presets.
                 const auto setLevel = native<void (*)(void*, Id, float, bool)>(setIntensity);
@@ -1495,6 +1518,7 @@ void sceneLights(void* object) {
         ReleaseSRWLockExclusive(&worldLock);
         return;
     }
+    advanceGameClock(GetTickCount64());
     bool animateInMenu;
     const auto settings = settingsForFrame(animateInMenu);
     AcquireSRWLockExclusive(&worldLock);
@@ -1821,9 +1845,7 @@ bool installDaylightHooks() {
     return true;
 }
 
-#if !UG_SUPPORT_EXTRA_OPTIONS
 #include "Anna.h"
-#endif
 #include "GarageInput.h"
 #include "PluginAnna.h"
 
@@ -1927,10 +1949,8 @@ DWORD WINAPI installHooks(void*) {
             if (!garageInput::install()) log("Underglow could not install its View/save-livery guard.");
             pluginAnna::install();
         } else {
-#if !UG_SUPPORT_EXTRA_OPTIONS
             if (anna::install()) log("Native ANNA audio effects are ready under Car > Underglow.");
             else log("ANNA audio effects are unavailable on this game build.");
-#endif
         }
     } else log("Garage Underglow stayed off because the garage menu hooks could not be installed.");
     if (platform) {

@@ -1,11 +1,9 @@
-#if !UG_SUPPORT_EXTRA_OPTIONS
 namespace pluginAnna {
 bool usesNativeMenu();
 }
 namespace anna {
 bool patchMarkup(std::string_view source, std::string& output);
 }
-#endif
 
 // Per-car Garage setups and the native Designs & Paints entry point.
 namespace garage {
@@ -189,7 +187,7 @@ bool validEffects(unsigned effects) {
     if (effects > rgbMask) return false;
     for (size_t zone = 0; zone < zoneCount; ++zone) {
         const int effect = zoneEffect(effects, zone);
-        if (effect >= fx::kEffectCount || isAudioEffect(effect)) return false;
+        if (effect >= fx::kEffectCount) return false;
     }
     return true;
 }
@@ -472,7 +470,7 @@ Record load(Id id) {
     // Free setups use the old balance field for history and light-switch flags.
     if (record.state == State::installed && !record.legacyFormat && legacyBalance <= 3) {
         record.pendingHistory = (legacyBalance & 1u) != 0;
-        record.lightsOff = supportExtraOptions && (legacyBalance & 2u) != 0;
+        record.lightsOff = (legacyBalance & 2u) != 0;
     }
     const auto* tail = data + end;
     bool hasSnapshotFormat = false;
@@ -793,19 +791,6 @@ bool setAudio(int effect, int zone) {
     return ok;
 }
 
-bool toggleLights() {
-    if (!supportExtraOptions) return false;
-    AcquireSRWLockExclusive(&garageLock);
-    auto record = load(activeId);
-    bool ok = false;
-    if (record.state == State::installed) {
-        record.lightsOff = !record.lightsOff;
-        ok = store(activeId, record);
-    }
-    ReleaseSRWLockExclusive(&garageLock);
-    return ok;
-}
-
 Id designCar(void* page) {
     const auto* bytes = static_cast<const Byte*>(page);
     const auto* table = read<const Byte*>(bytes);
@@ -976,9 +961,7 @@ void loadMarkup(void* loader) {
     const std::string_view source{text, static_cast<size_t>(length)};
     bool patched = patchDesigns(source, replacement) || patchColorSelect(source, replacement) ||
         patchOptionsMarkup(source, replacement);
-#if !UG_SUPPORT_EXTRA_OPTIONS
     if (!patched && pluginAnna::usesNativeMenu()) patched = anna::patchMarkup(source, replacement);
-#endif
     if (!patched) return;
     Byte* buffer = nullptr;
     native<Byte** (*)(Byte**, unsigned)>(0x208f320)(&buffer, static_cast<unsigned>(replacement.size() + 1));
@@ -1239,9 +1222,9 @@ bool updateSwatch(Byte* item, int choice, SwatchColors colors, std::wstring_view
     return true;
 }
 
-enum Tab { primaryColors, secondaryColors, oneColorEffects, twoColorEffects, multicolorEffects, previous, tabCount };
+enum Tab { primaryColors, secondaryColors, oneColorEffects, twoColorEffects, multicolorEffects, audioEffects, previous, tabCount };
 constexpr const wchar_t* tabTitles[]{L"PRIMARY UNDERGLOW", L"SECONDARY UNDERGLOW", L"EFFECTS WITH 1 COLOR",
-    L"EFFECTS WITH 2 COLORS", L"MULTICOLOR EFFECTS", L"PREVIOUS UNDERGLOWS"};
+    L"EFFECTS WITH 2 COLORS", L"MULTICOLOR EFFECTS", L"AUDIO VISUALIZER", L"PREVIOUS UNDERGLOWS"};
 static_assert(std::size(tabTitles) == tabCount);
 constexpr std::wstring_view emptyHistoryMessage = L"There are no previous underglows for this car.";
 
@@ -1250,6 +1233,7 @@ bool isColorTab(int tab) {
 }
 
 int effectGroupForTab(int tab) {
+    if (tab == audioEffects) return fx::kGroupAudio;
     return tab >= oneColorEffects && tab <= multicolorEffects ? fx::kGroupOneColor + tab - oneColorEffects : -1;
 }
 

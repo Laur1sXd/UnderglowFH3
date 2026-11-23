@@ -8,7 +8,7 @@ if errorlevel 1 exit /b 1
 :ready
 pushd "%~dp0src"
 if not exist build mkdir build
-cl /nologo /LD /std:c++20 /O2 /W4 /WX /wd4127 /EHsc /MT /DUG_SUPPORT_EXTRA_OPTIONS=1 /DUG_SUPPORT_HORIZON_RADIO_NETWORK=0 /Fo"build\\" Underglow.cpp pe.cpp /link /OUT:"build\Underglow.dll" /IMPLIB:"build\Underglow.lib" /DYNAMICBASE /NXCOMPAT
+cl /nologo /LD /std:c++20 /O2 /W4 /WX /wd4127 /EHsc /MT /Fo"build\\" Underglow.cpp pe.cpp /link /OUT:"build\Underglow.dll" /IMPLIB:"build\Underglow.lib" /DYNAMICBASE /NXCOMPAT
 set "BUILD_RESULT=%ERRORLEVEL%"
 popd
 exit /b %BUILD_RESULT%

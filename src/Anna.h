@@ -12,7 +12,7 @@ enum Action { Open, PickTarget, PickEffect, TurnPage, ToggleGlow };
 enum class HostPage { none, car, lights };
 constexpr size_t menuOffset = 0xf8;
 constexpr size_t pageSize = 7;
-constexpr int underglowCarRow = supportExtraOptions ? 1 : 0;
+constexpr int underglowCarRow = 0;
 
 constexpr int targetOrder[] = {0, fx::kZoneFront + 1, fx::kZoneRear + 1, fx::kZoneLeft + 1, fx::kZoneRight + 1};
 constexpr int targetCount = static_cast<int>(std::size(targetOrder));
@@ -66,8 +66,7 @@ bool named(const GameString* name, const char* value) {
 
 bool hostPrefix(const GameString* name) {
     return name && name->capacity == 15 && name->size >= 3 && name->size < sizeof(name->data.text) &&
-        ((supportExtraOptions && std::memcmp(name->data.text, "EO_", 3) == 0) ||
-         (supportHorizon3Extended && std::memcmp(name->data.text, "HX_", 3) == 0));
+        supportHorizon3Extended && std::memcmp(name->data.text, "HX_", 3) == 0;
 }
 
 bool hostEntry(const GameString* name, const char* label) {
@@ -216,7 +215,6 @@ bool paint(int first = 0, bool hostLights = false) {
         if (hostLights) emit(list, ToggleGlow, 0);
         else emit(list, Open, Underglow);
     } else if (menu.page == Car) {
-        if (supportExtraOptions) emit(list, Open, Lights);
         emit(list, Open, Underglow);
     } else if (menu.page == Lights) {
         emit(list, ToggleGlow, 0);
@@ -277,7 +275,7 @@ void finishHostMenu(void* component) {
     auto* list = listOf(component);
     if (menu.page != Native || !list || list != menu.rebuildingMenu ||
         menu.hostPage == HostPage::none || menu.inserted || !playerCar()) return;
-    if (!supportExtraOptions && menu.hostPage == HostPage::lights) return;
+    if (menu.hostPage == HostPage::lights) return;
     menu.inserted = true;
     if (menu.hostPage == HostPage::lights) emit(list, ToggleGlow, 0);
     else emit(list, Open, Underglow);
@@ -356,15 +354,7 @@ GameString* onSelection(void* component, GameString* out) {
         return out;
     }
 
-    if (action == Open && value == Lights) {
-        if (supportExtraOptions && state && underglowInstalled()) setPage(Lights);
-    } else if (action == ToggleGlow) {
-        if (supportExtraOptions && state && garage::toggleLights()) {
-            if (menu.page == Lights) paint();
-            else if (menu.page == Native && menu.hostPage == HostPage::lights)
-                paint(static_cast<int>(menu.hostCount), true);
-        }
-    } else if (disabledCommand(*out) || !underglowAvailable()) {
+    if (disabledCommand(*out) || !underglowAvailable()) {
         out->data.text[0] = '\0';
         out->size = 0;
         return out;
@@ -401,7 +391,6 @@ void** onLabel(void* self, void** out, const GameString* name) {
     if (!decode(name, action, value, state)) return labelOriginal(self, out, name);
     std::wstring label = L"Underglow";
     if (action == Open && value == Car) label = L"Car";
-    if (supportExtraOptions && action == Open && value == Lights) label = state ? L"Lights" : L"Lights (Off)";
     if (action == Open && value == Underglow && !state) label = L"Underglow (Off)";
     if (action == ToggleGlow) label = state == 1 ? L"Underglow Off" :
         state == 2 ? L"Underglow On" : L"Underglow (Off)";
@@ -452,7 +441,6 @@ bool patchMarkup(std::string_view source, std::string& output) {
         </DataTrigger>
     )XAML");
     };
-    if (supportExtraOptions) addDisabledTrigger("Lights");
     addDisabledTrigger("Underglow");
     addDisabledTrigger("Audio Visualizer");
     for (const auto* target : effectTargets) addDisabledTrigger(target);
@@ -536,7 +524,7 @@ bool install() {
         {0xa01ba0, "\x48\x8b\xc4\x55\x41\x56", reinterpret_cast<void*>(onDispatch), reinterpret_cast<void**>(&dispatchOriginal)},
     };
     if (!api->hook_function) return false;
-    const size_t count = std::size(hooks) - (supportExtraOptions || supportHorizon3Extended ? 0 : 1);
+    const size_t count = std::size(hooks) - (supportHorizon3Extended ? 0 : 1);
     for (size_t i = 0; i < count; ++i) {
         const auto& hook = hooks[i];
         if (std::memcmp(game + hook.rva, hook.prefix, std::strlen(hook.prefix))) return false;

@@ -1,6 +1,6 @@
 # Effect catalog
 
-Underglow offers 46 Garage effects and 15 radio-reactive effects in ANNA. The ID column matches the identifiers in the sample INI.
+Underglow offers 46 visual effects and 15 radio-reactive ones. The Garage lists all of them (the radio-reactive ones on the Audio Visualizer tab), and ANNA's Car > Underglow menu reaches them too. The ID column matches the identifiers in the sample INI.
 
 ## Effects with 1 Color
 
@@ -71,7 +71,7 @@ These effects supply their own palettes.
 
 ## Audio Visualizer
 
-Equip an underglow setup, then choose **ANNA → Car → Underglow → Audio Visualizer** in free roam.
+Pick these on the **Audio Visualizer** tab in Garage → Designs and Paints → Underglow, or equip a setup and choose **ANNA → Car → Underglow → Effect →** a part **→ Audio Visualizer** in free roam. When the radio is silent (the Garage mutes it) they run on a made-up beat for a few seconds so you can see them; real audio always takes over.
 
 | ID | Effect |
 | ---: | --- |

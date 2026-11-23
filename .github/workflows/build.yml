@@ -19,3 +19,16 @@ jobs:
       - name: Build Underglow
         shell: cmd
         run: build.cmd
+      - name: Check that the build made exactly one DLL
+        shell: cmd
+        run: |
+          if not exist src\build\Underglow.dll (echo src\build\Underglow.dll was not built & exit /b 1)
+          set count=0
+          for %%F in (src\build\*.dll) do set /a count+=1
+          if not "%count%"=="1" (echo Expected exactly one DLL in src\build, found %count% & exit /b 1)
+      - name: Upload Underglow.dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: Underglow
+          path: src/build/Underglow.dll
+          if-no-files-found: error
