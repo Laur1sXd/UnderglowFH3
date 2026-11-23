@@ -1,7 +1,5 @@
 # Underglow for FH3
 
-This is the source for **Underglow 1.0.1**, matching the `v1.0.1` release.
-
 Add neon underglow to your cars in Forza Horizon 3 on Azimuth. The mod uses the game's lights to illuminate the road, and the Garage lets you preview and save a different setup for each car.
 
 [Effect catalog](docs/EFFECTS.md) · [Configuration](docs/CONFIGURATION.md) · [Build from source](#build-from-source)
